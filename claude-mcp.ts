@@ -76,18 +76,47 @@ if (!ROOM_ID) {
 
 const BASE = `${BRIDGE_URL}/api/rooms/${encodeURIComponent(ROOM_ID)}`
 
+// ── Fetch role config (retry up to 5s to handle race with room creation) ──
+async function fetchRoleConfig(): Promise<{ name: string; claudeRole: string; codexRole: string } | null> {
+  for (let i = 0; i < 5; i++) {
+    try {
+      const res = await fetch(`${BASE}/config`, { signal: AbortSignal.timeout(3000) })
+      if (res.ok) {
+        const data = await res.json() as { roleTemplate: { name: string; claudeRole: string; codexRole: string } | null }
+        return data.roleTemplate
+      }
+    } catch {}
+    await Bun.sleep(1000)
+  }
+  return null
+}
+
+const roleConfig = await fetchRoleConfig()
+
+const baseInstructions = [
+  `You are connected to Codex Bridge, room ${ROOM_ID}.`,
+  'Messages from Codex arrive as <channel source="codex-bridge" sender="codex" ...>.',
+  'Reply with the reply tool. ALWAYS pass reply_to with the message_id — critical for routing.',
+  `Web UI: ${BRIDGE_URL}`,
+]
+
+if (roleConfig) {
+  baseInstructions.push(
+    '',
+    `=== 역할 템플릿: ${roleConfig.name} ===`,
+    roleConfig.claudeRole,
+    '이 역할에 맞게 Codex와 대화하세요. 역할에 어긋나는 단순 동의나 중립 응답은 피하세요.',
+  )
+  process.stderr.write(`[claude-mcp] role applied: ${roleConfig.name}\n`)
+}
+
 // ── MCP server ──
 
 const mcp = new Server(
   { name: `codex-bridge:${ROOM_ID}`, version: '0.3.0' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
-    instructions: [
-      `You are connected to Codex Bridge, room ${ROOM_ID}.`,
-      'Messages from Codex arrive as <channel source="codex-bridge" sender="codex" ...>.',
-      'Reply with the reply tool. ALWAYS pass reply_to with the message_id — critical for routing.',
-      `Web UI: ${BRIDGE_URL}`,
-    ].join('\n'),
+    instructions: baseInstructions.join('\n'),
   },
 )
 

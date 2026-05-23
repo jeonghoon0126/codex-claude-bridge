@@ -2,3 +2,5 @@ node_modules/
 bun.lock
 .DS_Store
 .omx/
+.env.sms
+.env.web

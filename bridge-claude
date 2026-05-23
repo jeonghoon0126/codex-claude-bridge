@@ -6,6 +6,8 @@
 #   bridge-claude ENG-1234
 
 ROOM="${1}"
+WORKDIR="${CODEX_BRIDGE_CWD:-$PWD}"
+CLAUDE_BIN="${CLAUDE_BIN:-/Users/wjh/.local/bin/claude}"
 
 if [ -z "$ROOM" ]; then
   echo "usage: bridge-claude <ROOM_ID>" >&2
@@ -14,4 +16,6 @@ if [ -z "$ROOM" ]; then
 fi
 
 printf "%s" "$ROOM" > "/tmp/claude-bridge-room-$$"
-exec claude --dangerously-load-development-channels server:codex-bridge
+export CODEX_BRIDGE_ROOM="$ROOM"
+cd "$WORKDIR" || exit 1
+exec "$CLAUDE_BIN" --dangerously-load-development-channels server:codex-bridge

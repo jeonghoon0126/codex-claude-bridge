@@ -10,6 +10,7 @@
  * covering-bridge.ts uses GET /api/rooms to show room status.
  */
 
+import { spawnSync } from 'child_process'
 import { writeFileSync, mkdirSync } from 'fs'
 import { readFileSync } from 'fs'
 import { homedir } from 'os'
@@ -19,6 +20,7 @@ import type { ServerWebSocket } from 'bun'
 const PORT = Number(process.env.CODEX_BRIDGE_PORT ?? 8788)
 const STATE_DIR = join(homedir(), '.claude', 'channels', 'codex-bridge')
 const FILES_DIR = join(STATE_DIR, 'files')
+const GHOSTTY_LAYOUT_GAP = Math.max(0, Number(process.env.CODEX_BRIDGE_GHOSTTY_LAYOUT_GAP ?? 8))
 
 // ── Types ──
 
@@ -55,8 +57,37 @@ type ClaudeWaiter = {
   cleanup: () => void
 }
 
+type GhosttyGrid = {
+  rows: number
+  cols: number
+}
+
+type GhosttyWindow = {
+  index: number
+  name: string
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+type ScreenFrame = {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+let ghosttyGrid: GhosttyGrid = { rows: 2, cols: 2 }
+
 // If no heartbeat/poll within this window, consider the agent disconnected.
 const HEARTBEAT_TIMEOUT_MS = 3000  // 3× the 1s heartbeat interval
+
+type RoleTemplate = {
+  name: string
+  claudeRole: string
+  codexRole: string
+}
 
 type RoomState = {
   id: string
@@ -68,6 +99,8 @@ type RoomState = {
   claudeLastSeen: number
   codexLastSeen: number
   lastActivity: number
+  // Collaboration role template (optional)
+  roleTemplate?: RoleTemplate
   // Codex → Claude reply tracking
   pendingReplies: Map<string, PendingReply>
   inFlightCodexMessages: Map<string, string>
@@ -216,6 +249,184 @@ function deliverMessageToClaude(
   }
 }
 
+function clampGridValue(value: unknown, fallback: number): number {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(8, Math.max(1, Math.round(n)))
+}
+
+function listGhosttyWindows(): GhosttyWindow[] {
+  const script = `
+tell application "System Events"
+  try
+    tell process "Ghostty"
+      set out to ""
+      repeat with i from 1 to count of windows
+        set w to window i
+        set winName to name of w
+        set winPos to position of w
+        set winSize to size of w
+        set out to out & (i as text) & "|" & winName & "|" & ((item 1 of winPos) as text) & "|" & ((item 2 of winPos) as text) & "|" & ((item 1 of winSize) as text) & "|" & ((item 2 of winSize) as text) & linefeed
+      end repeat
+      return out
+    end tell
+  on error
+    return ""
+  end try
+end tell`
+
+  const res = spawnSync('osascript', [], { encoding: 'utf8', input: script })
+  if (res.status !== 0) return []
+  return (res.stdout ?? '')
+    .trim()
+    .split('\n')
+    .map(line => {
+      const [indexRaw, name = '', xRaw, yRaw, widthRaw, heightRaw] = line.split('|')
+      const index = Number(indexRaw)
+      const x = Number(xRaw)
+      const y = Number(yRaw)
+      const width = Number(widthRaw)
+      const height = Number(heightRaw)
+      if (![index, x, y, width, height].every(Number.isFinite)) return null
+      return { index, name, x, y, width, height }
+    })
+    .filter((w): w is GhosttyWindow => Boolean(w))
+}
+
+function looksLikeCbridgeLeaderWindow(name: string): boolean {
+  return /\b(LEADER[- ][A-Z0-9_-]+|BRIDGE-CODEX)\b/i.test(name)
+}
+
+function targetGhosttyWindows(windows: GhosttyWindow[]): { windows: GhosttyWindow[]; fallbackToAll: boolean } {
+  const leaderWindows = windows.filter(w => looksLikeCbridgeLeaderWindow(w.name))
+  const selected = leaderWindows.length > 0 ? leaderWindows : windows
+  return {
+    windows: selected.sort((a, b) => (a.y - b.y) || (a.x - b.x) || (a.index - b.index)),
+    fallbackToAll: leaderWindows.length === 0,
+  }
+}
+
+function getScreenFrames(): ScreenFrame[] {
+  const quartzScript = `
+import json
+try:
+    import Quartz
+    main = Quartz.NSScreen.mainScreen()
+    main_height = float(main.frame().size.height)
+    frames = []
+    for screen in Quartz.NSScreen.screens():
+        frame = screen.visibleFrame()
+        frames.append({
+            "x": round(float(frame.origin.x)),
+            "y": round(main_height - (float(frame.origin.y) + float(frame.size.height))),
+            "width": round(float(frame.size.width)),
+            "height": round(float(frame.size.height)),
+        })
+    print(json.dumps(frames))
+except Exception:
+    print("[]")
+`
+  const py = spawnSync('python3', ['-c', quartzScript], { encoding: 'utf8' })
+  try {
+    const frames = JSON.parse(py.stdout || '[]') as ScreenFrame[]
+    if (Array.isArray(frames) && frames.length > 0) {
+      const usable = frames.filter(frame => frame.width > 0 && frame.height > 0)
+      if (usable.length > 0) return usable
+    }
+  } catch {}
+
+  const finder = spawnSync('osascript', ['-e', 'tell application "Finder" to get bounds of window of desktop'], { encoding: 'utf8' })
+  const parts = (finder.stdout ?? '').trim().split(',').map(part => Number(part.trim()))
+  if (parts.length === 4 && parts.every(Number.isFinite)) {
+    const [left, top, right, bottom] = parts
+    return [{ x: left, y: top, width: right - left, height: bottom - top }]
+  }
+  return [{ x: 0, y: 0, width: 1440, height: 900 }]
+}
+
+function overlapArea(a: ScreenFrame, b: ScreenFrame): number {
+  const left = Math.max(a.x, b.x)
+  const top = Math.max(a.y, b.y)
+  const right = Math.min(a.x + a.width, b.x + b.width)
+  const bottom = Math.min(a.y + a.height, b.y + b.height)
+  return Math.max(0, right - left) * Math.max(0, bottom - top)
+}
+
+function selectLayoutFrame(windows: GhosttyWindow[]): ScreenFrame {
+  const screens = getScreenFrames()
+  if (screens.length === 1 || windows.length === 0) return screens[0]
+
+  const group = windows.reduce<ScreenFrame>((acc, win) => {
+    const right = Math.max(acc.x + acc.width, win.x + win.width)
+    const bottom = Math.max(acc.y + acc.height, win.y + win.height)
+    const left = Math.min(acc.x, win.x)
+    const top = Math.min(acc.y, win.y)
+    return { x: left, y: top, width: right - left, height: bottom - top }
+  }, { x: windows[0].x, y: windows[0].y, width: windows[0].width, height: windows[0].height })
+
+  return screens
+    .map(frame => ({ frame, area: overlapArea(frame, group) }))
+    .sort((a, b) => b.area - a.area)[0]?.frame ?? screens[0]
+}
+
+function moveGhosttyWindows(placements: Array<GhosttyWindow & ScreenFrame>): void {
+  if (placements.length === 0) return
+  const commands = placements.flatMap(win => [
+    `set position of window ${win.index} to {${Math.round(win.x)}, ${Math.round(win.y)}}`,
+    `set size of window ${win.index} to {${Math.round(win.width)}, ${Math.round(win.height)}}`,
+  ])
+  const script = `
+tell application "System Events"
+  try
+    tell process "Ghostty"
+      ${commands.join('\n      ')}
+    end tell
+  on error errText
+    error errText
+  end try
+end tell`
+  const res = spawnSync('osascript', [], { encoding: 'utf8', input: script })
+  if (res.status !== 0) {
+    throw new Error((res.stderr || res.stdout || 'Ghostty window move failed').trim())
+  }
+}
+
+function applyGhosttyLayout(rows: number, cols: number, dryRun = false) {
+  const all = listGhosttyWindows()
+  const target = targetGhosttyWindows(all)
+  const frame = selectLayoutFrame(target.windows)
+  const capacity = rows * cols
+  const arranged = target.windows.slice(0, capacity)
+  const gap = GHOSTTY_LAYOUT_GAP
+  const cellWidth = Math.max(320, Math.floor((frame.width - gap * (cols - 1)) / cols))
+  const cellHeight = Math.max(260, Math.floor((frame.height - gap * (rows - 1)) / rows))
+
+  const placements = arranged.map((win, i) => {
+    const row = Math.floor(i / cols)
+    const col = i % cols
+    return {
+      ...win,
+      x: frame.x + col * (cellWidth + gap),
+      y: frame.y + row * (cellHeight + gap),
+      width: cellWidth,
+      height: cellHeight,
+    }
+  })
+
+  if (!dryRun) moveGhosttyWindows(placements)
+  return {
+    rows,
+    cols,
+    dryRun,
+    matched: target.windows.length,
+    arranged: placements.length,
+    unplaced: Math.max(0, target.windows.length - placements.length),
+    fallbackToAll: target.fallbackToAll,
+    frame,
+    windows: placements.map(win => ({ index: win.index, name: win.name })),
+  }
+}
+
 // ── HTTP server ──
 
 Bun.serve({
@@ -257,13 +468,86 @@ Bun.serve({
       return Response.json(list)
     }
 
+    // ── GET/POST /api/ghostty-layout — arrange cbridge leader Ghostty windows ──
+    if (path === '/api/ghostty-layout' && req.method === 'GET') {
+      const all = listGhosttyWindows()
+      const target = targetGhosttyWindows(all)
+      return Response.json({
+        rows: ghosttyGrid.rows,
+        cols: ghosttyGrid.cols,
+        total: all.length,
+        matched: target.windows.length,
+        fallbackToAll: target.fallbackToAll,
+        windows: target.windows.map(win => ({ index: win.index, name: win.name })),
+      })
+    }
+
+    if (path === '/api/ghostty-layout' && req.method === 'POST') {
+      return (async () => {
+        try {
+          const body = await req.json().catch(() => ({})) as {
+            action?: string
+            layout?: string
+            rows?: number
+            cols?: number
+            dryRun?: boolean
+          }
+          let rows = ghosttyGrid.rows
+          let cols = ghosttyGrid.cols
+
+          if (body.layout === '2x2') {
+            rows = 2
+            cols = 2
+          } else if (body.layout === '4x1') {
+            rows = 1
+            cols = 4
+          } else if (body.action === 'add-row') {
+            rows += 1
+          } else if (body.action === 'remove-row') {
+            rows -= 1
+          } else if (body.action === 'add-col') {
+            cols += 1
+          } else if (body.action === 'remove-col') {
+            cols -= 1
+          }
+
+          rows = clampGridValue(body.rows ?? rows, ghosttyGrid.rows)
+          cols = clampGridValue(body.cols ?? cols, ghosttyGrid.cols)
+          ghosttyGrid = { rows, cols }
+          return Response.json({ ok: true, ...applyGhosttyLayout(rows, cols, body.dryRun === true) })
+        } catch (err) {
+          return Response.json({
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          }, { status: 500 })
+        }
+      })()
+    }
+
     // ── POST /api/rooms/:roomId — pre-create room (called by covering-bridge) ──
+    // ── GET  /api/rooms/:roomId/config — role template config ──
     // ── DELETE /api/rooms/:roomId — close room ──
     const closeMatch = path.match(/^\/api\/rooms\/([^/]+)$/)
+    const configMatch = path.match(/^\/api\/rooms\/([^/]+)\/config$/)
+    if (configMatch && req.method === 'GET') {
+      const roomId = decodeURIComponent(configMatch[1])
+      const room = rooms.get(roomId)
+      if (!room) return Response.json({ error: 'room not found' }, { status: 404 })
+      return Response.json({ roomId, roleTemplate: room.roleTemplate ?? null })
+    }
     if (closeMatch && req.method === 'POST') {
       const roomId = decodeURIComponent(closeMatch[1])
-      getOrCreateRoom(roomId)
-      return new Response(null, { status: 201 })
+      const room = getOrCreateRoom(roomId)
+      return (async () => {
+        try {
+          const body = await req.json() as { roleTemplate?: { name: string; claudeRole: string; codexRole: string } }
+          if (body?.roleTemplate?.name) {
+            room.roleTemplate = body.roleTemplate
+            process.stderr.write(`[bridge] role set for room ${roomId}: ${body.roleTemplate.name}\n`)
+          }
+        } catch {}
+        return new Response(null, { status: 201 })
+      })()
     }
     if (closeMatch && req.method === 'DELETE') {
       const roomId = decodeURIComponent(closeMatch[1])
@@ -426,7 +710,7 @@ Bun.serve({
       touchRoom(room)
 
       const msgId = pollMatch[1]
-      const timeout = Number(url.searchParams.get('timeout') ?? 120000)
+      const timeout = Number(url.searchParams.get('timeout') ?? 3600000)
       const pending = room.pendingReplies.get(msgId)
 
       if (!pending) return Response.json({ timeout: true, reply: null })
@@ -449,7 +733,7 @@ Bun.serve({
             pending.waiters.delete(waiter)
             waiter.cleanup()
             resolve(Response.json({ timeout: true, reply: null }))
-          }, Math.min(timeout, 300000)),
+          }, Math.min(timeout, 3600000)),
           cleanup: () => {
             clearTimeout(waiter.timer)
             req.signal.removeEventListener('abort', onAbort)
@@ -564,6 +848,16 @@ const HTML = `<!doctype html>
   #text::placeholder { color: #555; }
   button.send { background: linear-gradient(135deg, #00d4aa, #7b61ff); color: #fff; font-weight: 600; padding: 8px 16px; border-radius: 10px; border: none; cursor: pointer; }
   button.send:disabled { opacity: 0.3; cursor: default; }
+  button.layout { background: #1a1a1a; border: 1px solid #333; color: #cfd3dc; padding: 5px 10px; border-radius: 8px; font-size: 12px; cursor: pointer; }
+  button.layout:hover { border-color: #555; color: #fff; }
+  #layout-menu { position: fixed; z-index: 20; min-width: 184px; padding: 6px; border: 1px solid #333; border-radius: 10px; background: #151515; box-shadow: 0 16px 36px rgba(0,0,0,.34); display: none; }
+  #layout-menu.open { display: block; }
+  #layout-menu button { width: 100%; border: 0; background: transparent; color: #e0e0e0; text-align: left; padding: 8px 10px; border-radius: 7px; font: inherit; font-size: 13px; cursor: pointer; }
+  #layout-menu button:hover { background: #242424; }
+  .menu-label { padding: 7px 10px 4px; color: #777; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+  .menu-sep { height: 1px; margin: 5px 4px; background: #2a2a2a; }
+  #layout-toast { position: fixed; right: 18px; bottom: 18px; z-index: 21; max-width: min(360px, calc(100vw - 36px)); padding: 10px 12px; border: 1px solid #333; border-radius: 10px; background: #151515; color: #d9dee8; font-size: 13px; box-shadow: 0 16px 36px rgba(0,0,0,.34); opacity: 0; transform: translateY(8px); pointer-events: none; transition: opacity .16s ease, transform .16s ease; }
+  #layout-toast.show { opacity: 1; transform: translateY(0); }
   #log::-webkit-scrollbar { width: 6px; }
   #log::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
 </style>
@@ -572,6 +866,7 @@ const HTML = `<!doctype html>
 <header>
   <div class="logo">CB</div>
   <h1>Codex Bridge</h1>
+  <button type="button" class="layout" id="layout-btn">Layout</button>
   <select id="room-select"></select>
   <div class="status">
     <div class="dot" id="dot"></div>
@@ -585,6 +880,17 @@ const HTML = `<!doctype html>
     <button type="submit" class="send" id="send-btn" disabled>Send</button>
   </form>
 </div>
+<div id="layout-menu" role="menu">
+  <div class="menu-label">Ghostty layout</div>
+  <button type="button" data-layout="2x2">2행 2열</button>
+  <button type="button" data-layout="4x1">4열 1행</button>
+  <div class="menu-sep"></div>
+  <button type="button" data-action="add-row">행 추가</button>
+  <button type="button" data-action="remove-row">행 삭제</button>
+  <button type="button" data-action="add-col">열 추가</button>
+  <button type="button" data-action="remove-col">열 삭제</button>
+</div>
+<div id="layout-toast"></div>
 <script>
 const log = document.getElementById('log')
 const form = document.getElementById('form')
@@ -593,10 +899,57 @@ const sendBtn = document.getElementById('send-btn')
 const dot = document.getElementById('dot')
 const statusText = document.getElementById('status-text')
 const roomSelect = document.getElementById('room-select')
+const layoutBtn = document.getElementById('layout-btn')
+const layoutMenu = document.getElementById('layout-menu')
+const layoutToast = document.getElementById('layout-toast')
 
 let currentRoom = null
 let ws = null
 let uid = 0
+let toastTimer = null
+
+function clampMenuToViewport(x, y) {
+  const rect = layoutMenu.getBoundingClientRect()
+  return {
+    x: Math.min(x, window.innerWidth - rect.width - 10),
+    y: Math.min(y, window.innerHeight - rect.height - 10),
+  }
+}
+
+function openLayoutMenu(x, y) {
+  layoutMenu.classList.add('open')
+  const pos = clampMenuToViewport(x, y)
+  layoutMenu.style.left = Math.max(10, pos.x) + 'px'
+  layoutMenu.style.top = Math.max(10, pos.y) + 'px'
+}
+
+function closeLayoutMenu() {
+  layoutMenu.classList.remove('open')
+}
+
+function showLayoutToast(message) {
+  layoutToast.textContent = message
+  layoutToast.classList.add('show')
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => layoutToast.classList.remove('show'), 2200)
+}
+
+async function applyLayout(payload) {
+  closeLayoutMenu()
+  try {
+    const res = await fetch('/api/ghostty-layout', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const data = await res.json()
+    if (!res.ok || !data.ok) throw new Error(data.error || 'layout failed')
+    const suffix = data.fallbackToAll ? ' · leader 제목 없음, Ghostty 전체 적용' : ''
+    showLayoutToast(data.rows + '행 ' + data.cols + '열 적용 · ' + data.arranged + '개 창 이동' + suffix)
+  } catch (err) {
+    showLayoutToast('Layout 실패: ' + (err && err.message ? err.message : String(err)))
+  }
+}
 
 async function loadRooms() {
   let data = []
@@ -658,6 +1011,33 @@ function connect(roomId) {
 }
 
 roomSelect.addEventListener('change', () => switchRoom(roomSelect.value))
+
+document.addEventListener('contextmenu', e => {
+  e.preventDefault()
+  openLayoutMenu(e.clientX, e.clientY)
+})
+
+document.addEventListener('click', e => {
+  if (!layoutMenu.contains(e.target) && e.target !== layoutBtn) closeLayoutMenu()
+})
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeLayoutMenu()
+})
+
+layoutBtn.addEventListener('click', e => {
+  const rect = layoutBtn.getBoundingClientRect()
+  openLayoutMenu(rect.left, rect.bottom + 6)
+})
+
+layoutMenu.addEventListener('click', e => {
+  const target = e.target.closest('button')
+  if (!target) return
+  const layout = target.dataset.layout
+  const action = target.dataset.action
+  if (layout) applyLayout({ layout })
+  if (action) applyLayout({ action })
+})
 
 form.addEventListener('submit', e => {
   e.preventDefault()

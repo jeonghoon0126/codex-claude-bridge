@@ -13,8 +13,10 @@
  *   CODEX_BRIDGE_ROOM=ENG-1234 codex --full-auto
  *
  * Tools:
- *   send_to_claude(message) — Send a message to Claude. Blocks until Claude replies (~2 min max).
+ *   send_to_claude(message) — Send a message to Claude. Blocks until Claude replies (~60 min max).
  *   check_claude_messages() — Check if Claude has sent any proactive messages.
+ *   send_to_codex_peer(message) — Alias for Codex-Codex rooms.
+ *   check_codex_peer_messages() — Alias for Codex-Codex rooms.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -25,26 +27,51 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { execFileSync } from 'child_process'
 import { readFileSync } from 'fs'
+import { codexMcpTotalWaitMs } from './bridge-timeouts.ts'
 
 const BRIDGE_URL = process.env.CODEX_BRIDGE_URL ?? 'http://localhost:8788'
-const TOTAL_WAIT_MS = 110000
+const PEER_NAME = process.env.CODEX_BRIDGE_PEER_NAME ?? 'Codex peer'
+const TOTAL_WAIT_MS = codexMcpTotalWaitMs()
 const POLL_SLICE_MS = 15000
 const POLL_ABORT_GRACE_MS = 3000
 
-// Codex strips most env vars when spawning MCP servers (only HOME/LANG/PATH survive).
-// Fallback: covering-bridge starts Codex via `sh -c 'printf "roomId:token" > /tmp/codex-bridge-room-$$; exec codex'`.
-// Because exec replaces sh without changing PID, $$ == the node-wrapper PID.
-// codex-mcp.ts traverses: process.ppid (codex binary) → its PPID (node wrapper) → reads the file.
+// Codex may strip env vars when spawning MCP servers.
+// Fallback: bridge-codex writes /tmp/codex-bridge-room-<pid> before execing Codex.
+// Process ancestry differs between Codex releases, so walk nearby parents instead of
+// relying on one fixed parent depth.
 function getRoomAndTokenFromPidFile(): { roomId: string; token: string } {
+  const readBridgeFile = (pid: number) => {
+    try {
+      return readFileSync(`/tmp/codex-bridge-room-${pid}`, 'utf8').trim()
+    } catch {
+      return ''
+    }
+  }
+
+  const parentPid = (pid: number) => {
+    try {
+      const raw = execFileSync('ps', ['-o', 'ppid=', '-p', String(pid)], { timeout: 2000 })
+        .toString().trim()
+      const parsed = parseInt(raw, 10)
+      return parsed && !isNaN(parsed) ? parsed : 0
+    } catch {
+      return 0
+    }
+  }
+
   try {
-    const codexBinaryPid = process.ppid
-    const nodeWrapperPid = parseInt(
-      execFileSync('ps', ['-o', 'ppid=', '-p', String(codexBinaryPid)], { timeout: 2000 })
-        .toString().trim(),
-      10,
-    )
-    if (!nodeWrapperPid || isNaN(nodeWrapperPid)) return { roomId: '', token: '' }
-    const content = readFileSync(`/tmp/codex-bridge-room-${nodeWrapperPid}`, 'utf8').trim()
+    const seen = new Set<number>()
+    let pid = process.pid
+    let content = ''
+
+    for (let i = 0; i < 8 && pid > 1 && !seen.has(pid); i++) {
+      seen.add(pid)
+      content = readBridgeFile(pid)
+      if (content) break
+      pid = parentPid(pid)
+    }
+
+    if (!content) return { roomId: '', token: '' }
     const idx = content.indexOf(':')
     if (idx === -1) return { roomId: content, token: '' }
     return { roomId: content.slice(0, idx), token: content.slice(idx + 1) }
@@ -55,15 +82,35 @@ function getRoomAndTokenFromPidFile(): { roomId: string; token: string } {
 
 const { roomId: pidFileRoom } = getRoomAndTokenFromPidFile()
 const ROOM_ID = process.env.CODEX_BRIDGE_ROOM || pidFileRoom
+const HAS_ROOM = Boolean(ROOM_ID)
 
-if (!ROOM_ID) {
-  process.stderr.write(
-    'codex-mcp: room not found — set CODEX_BRIDGE_ROOM or use covering-bridge to open rooms\n',
-  )
-  process.exit(1)
+if (!HAS_ROOM) {
+  process.stderr.write('codex-mcp: no bridge room bound; starting without bridge tools\n')
 }
 
-const BASE = `${BRIDGE_URL}/api/rooms/${encodeURIComponent(ROOM_ID)}`
+const BASE = HAS_ROOM ? `${BRIDGE_URL}/api/rooms/${encodeURIComponent(ROOM_ID)}` : ''
+
+// ── Fetch role config (retry up to 5s to handle race with room creation) ──
+async function fetchRoleConfig(): Promise<{ name: string; codexRole: string } | null> {
+  if (!HAS_ROOM) return null
+
+  for (let i = 0; i < 5; i++) {
+    try {
+      const res = await fetch(`${BASE}/config`, { signal: AbortSignal.timeout(3000) })
+      if (res.ok) {
+        const data = await res.json() as { roleTemplate: { name: string; claudeRole: string; codexRole: string } | null }
+        if (data.roleTemplate) return { name: data.roleTemplate.name, codexRole: data.roleTemplate.codexRole }
+      }
+    } catch {}
+    await Bun.sleep(1000)
+  }
+  return null
+}
+
+const roleConfig = await fetchRoleConfig()
+if (roleConfig) {
+  process.stderr.write(`[codex-mcp] role applied: ${roleConfig.name}\n`)
+}
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean }
 
@@ -78,52 +125,104 @@ function formatElapsedMs(startMs: number) {
 }
 
 const mcp = new Server(
-  { name: `codex-bridge-client:${ROOM_ID}`, version: '0.3.0' },
+  { name: `codex-bridge-client:${ROOM_ID || 'unbound'}`, version: '0.3.0' },
   { capabilities: { tools: {} } },
 )
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: 'send_to_claude',
-      description: [
-        `Send a message to Claude Code through Codex Bridge (room: ${ROOM_ID}) and wait for a reply.`,
-        'This tool blocks until Claude responds (up to about 2 minutes).',
-        'Use this to collaborate with Claude: ask questions, propose approaches,',
-        'debate architecture decisions, or reach consensus on implementation details.',
-        '',
-        'IMPORTANT: This is a conversation tool. If Claude replies with a question,',
-        'a counter-proposal, or consensus has not been reached, call this tool AGAIN.',
-        'Keep calling it until you and Claude have fully resolved the topic.',
-        'Do not call this tool concurrently with the same message.',
-        'If it times out, do not immediately resend the exact same prompt.',
-      ].join(' '),
-      inputSchema: {
-        type: 'object',
-        properties: {
-          message: { type: 'string', description: 'The message to send to Claude' },
+const rolePreamble = roleConfig
+  ? [
+      `=== 역할 템플릿: ${roleConfig.name} ===`,
+      roleConfig.codexRole,
+      '이 역할에 맞게 상대 에이전트와 대화하세요. 역할에 어긋나는 단순 동의나 중립 응답은 피하세요.',
+      '',
+    ].join(' ')
+  : ''
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+  if (!HAS_ROOM) return { tools: [] }
+
+  return {
+    tools: [
+      {
+        name: 'send_to_claude',
+        description: [
+          rolePreamble,
+          `Send a message to Claude Code through Codex Bridge (room: ${ROOM_ID}) and wait for a reply.`,
+          'This tool blocks until Claude responds (up to about 60 minutes).',
+          'Use this to collaborate with Claude: ask questions, propose approaches,',
+          'debate architecture decisions, or reach consensus on implementation details.',
+          '',
+          'IMPORTANT: This is a conversation tool. If Claude replies with a question,',
+          'a counter-proposal, or consensus has not been reached, call this tool AGAIN.',
+          'Keep calling it until you and Claude have fully resolved the topic.',
+          'Do not call this tool concurrently with the same message.',
+          'If it times out, do not immediately resend the exact same prompt.',
+        ].filter(Boolean).join(' '),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            message: { type: 'string', description: 'The message to send to Claude' },
+          },
+          required: ['message'],
         },
-        required: ['message'],
       },
-    },
-    {
-      name: 'check_claude_messages',
-      description: [
-        'Check if Claude has sent any proactive messages in this room.',
-        'Returns pending messages from Claude that you have not seen yet.',
-      ].join(' '),
-      inputSchema: { type: 'object', properties: {} },
-    },
-  ],
-}))
+      {
+        name: 'send_to_codex_peer',
+        description: [
+          rolePreamble,
+          `Send a message to the second Codex agent through Codex Bridge (room: ${ROOM_ID}) and wait for a reply.`,
+          'This tool blocks until the Codex peer responds.',
+          'Use this when running bridge-codex-peer on the responder side.',
+          'Keep calling it until the discussion has fully resolved the topic.',
+          'Do not call this tool concurrently with the same message.',
+        ].filter(Boolean).join(' '),
+        inputSchema: {
+          type: 'object',
+          properties: {
+            message: { type: 'string', description: 'The message to send to the Codex peer' },
+          },
+          required: ['message'],
+        },
+      },
+      {
+        name: 'check_claude_messages',
+        description: [
+          'Check if Claude has sent any proactive messages in this room.',
+          'Returns pending messages from Claude that you have not seen yet.',
+        ].join(' '),
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'check_codex_peer_messages',
+        description: [
+          'Check if the Codex peer has sent any proactive messages in this room.',
+          'Returns pending messages from the Codex peer that you have not seen yet.',
+        ].join(' '),
+        inputSchema: { type: 'object', properties: {} },
+      },
+    ],
+  }
+})
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
 
+  if (!HAS_ROOM) {
+    return {
+      content: [{
+        type: 'text',
+        text: 'error: Codex Bridge room is not configured for this Codex session.',
+      }],
+      isError: true,
+    }
+  }
+
   try {
     switch (req.params.name) {
-      case 'send_to_claude': {
+      case 'send_to_claude':
+      case 'send_to_codex_peer': {
         const message = args.message as string
+        const peerName = req.params.name === 'send_to_codex_peer' ? PEER_NAME : 'Claude'
         if (!message?.trim()) {
           return { content: [{ type: 'text', text: 'error: empty message' }], isError: true }
         }
@@ -191,7 +290,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               return {
                 content: [{
                   type: 'text',
-                  text: `Claude returned no reply after ${formatElapsedMs(startedAt)}. Do not immediately resend the same prompt.`,
+                  text: `${peerName} returned no reply after ${formatElapsedMs(startedAt)}. Do not immediately resend the same prompt.`,
                 }],
               }
             }
@@ -200,7 +299,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           return {
             content: [{
               type: 'text',
-              text: `Claude did not reply within ${formatElapsedMs(startedAt)}. Do not immediately resend the same prompt.`,
+              text: `${peerName} did not reply within ${formatElapsedMs(startedAt)}. Do not immediately resend the same prompt.`,
             }],
           }
         })()
@@ -215,7 +314,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
       }
 
-      case 'check_claude_messages': {
+      case 'check_claude_messages':
+      case 'check_codex_peer_messages': {
+        const peerName = req.params.name === 'check_codex_peer_messages' ? PEER_NAME : 'Claude'
         const res = await fetch(`${BASE}/pending-for-codex`)
         if (!res.ok) {
           return {
@@ -225,10 +326,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         const { messages } = await res.json() as { messages: { id: string; text: string }[] }
         if (messages.length === 0) {
-          return { content: [{ type: 'text', text: 'No pending messages from Claude.' }] }
+          return { content: [{ type: 'text', text: `No pending messages from ${peerName}.` }] }
         }
         const formatted = messages.map(m => `[${m.id}] ${m.text}`).join('\n\n---\n\n')
-        return { content: [{ type: 'text', text: `${messages.length} message(s) from Claude:\n\n${formatted}` }] }
+        return { content: [{ type: 'text', text: `${messages.length} message(s) from ${peerName}:\n\n${formatted}` }] }
       }
 
       default:
@@ -258,6 +359,8 @@ function isParentAlive(): boolean {
 }
 
 async function heartbeat() {
+  if (!HAS_ROOM) return
+
   if (!isParentAlive()) {
     process.stderr.write(`[codex-mcp] parent gone — exiting\n`)
     await unregister()
@@ -273,6 +376,8 @@ async function heartbeat() {
 }
 
 async function unregister() {
+  if (!HAS_ROOM) return
+
   try {
     await fetch(`${BASE}/codex/heartbeat`, { method: 'DELETE', signal: AbortSignal.timeout(3000) })
   } catch {}
@@ -283,6 +388,8 @@ process.on('SIGINT', () => { void unregister().finally(() => process.exit(0)) })
 process.on('SIGTERM', () => { void unregister().finally(() => process.exit(0)) })
 
 await mcp.connect(new StdioServerTransport())
-await heartbeat()  // immediate ✓ on connect
-setInterval(heartbeat, HEARTBEAT_INTERVAL_MS)  // keep alive every 30s
-process.stderr.write(`codex-bridge-client: ready  room=${ROOM_ID}  bridge=${BRIDGE_URL}\n`)
+if (HAS_ROOM) {
+  await heartbeat()
+  setInterval(heartbeat, HEARTBEAT_INTERVAL_MS)
+}
+process.stderr.write(`codex-bridge-client: ready  room=${ROOM_ID || 'unbound'}  bridge=${BRIDGE_URL}\n`)

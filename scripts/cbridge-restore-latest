@@ -1,0 +1,305 @@
+#!/bin/zsh
+set -euo pipefail
+
+HOME_DIR="${HOME:-/Users/wjh}"
+BRIDGE_DIR="${CBRIDGE_DIR:-$HOME_DIR/codex-claude-bridge}"
+TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+BUN_BIN="${BUN_BIN:-$HOME_DIR/.bun/bin/bun}"
+CODEX_BIN="${CODEX_BIN:-$HOME_DIR/.local/bin/codex}"
+CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
+OPEN_BIN="${OPEN_BIN:-/usr/bin/open}"
+CONFIG="${CBRIDGE_RESTORE_CONFIG:-$HOME_DIR/.codex-claude-bridge/restore-rooms.tsv}"
+BRIDGE_URL="${CODEX_BRIDGE_URL:-http://localhost:8788}"
+LOG_DIR="$HOME_DIR/.codex-claude-bridge/logs"
+OPEN_WINDOWS="${CBRIDGE_RESTORE_OPEN_WINDOWS:-1}"
+FORCE="${CBRIDGE_RESTORE_FORCE:-0}"
+MODE="${1:-restore}"
+RESTORE_WIDTH="${CBRIDGE_RESTORE_WIDTH:-300}"
+RESTORE_HEIGHT="${CBRIDGE_RESTORE_HEIGHT:-50}"
+LEADERS_SESSION="${CBRIDGE_RESTORE_LEADERS_SESSION:-cbridge-leaders-main}"
+LEADER_TAB_SESSION_PREFIX="${CBRIDGE_RESTORE_LEADER_TAB_SESSION_PREFIX:-cbridge-leaders-tab}"
+GHOSTTY_APP="${CBRIDGE_GHOSTTY_APP:-/Applications/Ghostty.app}"
+GHOSTTY_TAB_DELAY="${CBRIDGE_GHOSTTY_TAB_DELAY:-0.35}"
+
+mkdir -p "$LOG_DIR"
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_DIR/restore.log" }
+quote() { printf "%q" "$1" }
+
+require_file() {
+  if [[ ! -e "$1" ]]; then
+    log "missing: $1"
+    exit 1
+  fi
+}
+
+require_file "$CONFIG"
+require_file "$BRIDGE_DIR/bridge-server.ts"
+require_file "$BRIDGE_DIR/bridge-codex-peer"
+require_file "$BRIDGE_DIR/covering-bridge.ts"
+
+snapshot_current() {
+  local tmp
+  tmp="$(mktemp "$CONFIG.tmp.XXXXXX")"
+  printf '# room\tthread_id\tcwd\tleader_group\n' > "$tmp"
+
+  "$TMUX_BIN" list-panes -a -F '#{session_name}|#{window_name}|#{pane_pid}|#{pane_current_path}|#{@cbridge_room}|#{@cbridge_thread_id}' 2>/dev/null |
+    while IFS='|' read -r session window pid cwd room thread; do
+      [[ "$session" == cbridge-leaders-* ]] || continue
+      [[ "$session" == "$LEADER_TAB_SESSION_PREFIX"-* ]] && continue
+      [[ -n "${room:-}" ]] || continue
+      if [[ -z "${thread:-}" ]]; then
+        thread="$(ps -o args= -p "$pid" 2>/dev/null | sed -nE 's/.* resume ([0-9a-fA-F-]{36}).*/\1/p' | head -n 1)"
+      fi
+      [[ -n "${thread:-}" ]] || continue
+      if [[ "$session" == "$LEADERS_SESSION" ]]; then
+        printf '%s\t%s\t%s\t%s:%s\n' "$room" "$thread" "$cwd" "$session" "$window" >> "$tmp"
+      else
+        printf '%s\t%s\t%s\t%s\n' "$room" "$thread" "$cwd" "$session" >> "$tmp"
+      fi
+    done
+
+  if [[ "$(wc -l < "$tmp" | tr -d ' ')" -gt 1 ]]; then
+    mv "$tmp" "$CONFIG"
+    log "snapshot saved"
+  else
+    rm -f "$tmp"
+    log "snapshot skipped; no restorable leader panes"
+  fi
+}
+
+if [[ "$MODE" == "--snapshot" || "$MODE" == "snapshot" ]]; then
+  snapshot_current
+  exit 0
+fi
+
+ensure_bridge_server() {
+  if "$CURL_BIN" -fsS "$BRIDGE_URL/api/rooms" >/dev/null 2>&1; then
+    return
+  fi
+  if ! "$TMUX_BIN" has-session -t cbridge-server 2>/dev/null; then
+    "$TMUX_BIN" new-session -d -s cbridge-server -n server -c "$BRIDGE_DIR" \
+      "$(quote "$BUN_BIN") $(quote "$BRIDGE_DIR/bridge-server.ts")"
+  fi
+  for _ in {1..40}; do
+    if "$CURL_BIN" -fsS "$BRIDGE_URL/api/rooms" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.25
+  done
+  log "bridge server did not become ready"
+}
+
+post_room() {
+  local room="$1"
+  "$CURL_BIN" -fsS -X POST "$BRIDGE_URL/api/rooms/$room" >/dev/null 2>&1 || true
+}
+
+leader_cmd() {
+  local room="$1" thread="$2" cwd="$3"
+  local cfg="mcp_servers.codex-bridge.env.CODEX_BRIDGE_ROOM=\"$room\""
+  printf 'cd %s && printf "%%s" %s > /tmp/codex-bridge-room-$$; printf "\033]0;%s\007"; export CODEX_BRIDGE_ROOM=%s CODEX_BRIDGE_CWD=%s CODEX_BRIDGE_URL=%s; %s resume %s -c %s --model gpt-5.5 -c model_reasoning_effort="xhigh" --sandbox danger-full-access -a never --no-alt-screen' \
+    "$(quote "$cwd")" "$(quote "$room")" "$room" "$(quote "$room")" "$(quote "$cwd")" "$(quote "$BRIDGE_URL")" "$(quote "$CODEX_BIN")" "$(quote "$thread")" "$(quote "$cfg")"
+}
+
+peer_cmd() {
+  local room="$1" cwd="$2"
+  printf 'cd %s && export CODEX_BRIDGE_ROOM=%s CODEX_BRIDGE_CWD=%s CODEX_PEER_CWD=%s CODEX_BRIDGE_URL=%s; exec %s %s' \
+    "$(quote "$cwd")" "$(quote "$room")" "$(quote "$cwd")" "$(quote "$cwd")" "$(quote "$BRIDGE_URL")" "$(quote "$BRIDGE_DIR/bridge-codex-peer")" "$(quote "$room")"
+}
+
+typeset -a rooms threads cwds room_groups
+while IFS=$'\t' read -r room thread cwd group; do
+  [[ -z "${room:-}" || "$room" == \#* ]] && continue
+  rooms+=("$room")
+  threads+=("$thread")
+  cwds+=("$cwd")
+  room_groups+=("$group")
+done < "$CONFIG"
+
+if (( ${#rooms[@]} == 0 )); then
+  log "no rooms in $CONFIG"
+  exit 1
+fi
+
+ensure_bridge_server
+"$BUN_BIN" "$BRIDGE_DIR/covering-bridge.ts" tmux-pane-titles --start >/dev/null 2>&1 || true
+
+if [[ "$FORCE" == "1" ]]; then
+  "$TMUX_BIN" list-sessions -F '#{session_name}' 2>/dev/null |
+    while IFS= read -r tab_session; do
+      [[ "$tab_session" == "$LEADER_TAB_SESSION_PREFIX"-* ]] || continue
+      "$TMUX_BIN" kill-session -t "$tab_session" 2>/dev/null || true
+    done
+  "$TMUX_BIN" kill-session -t "$LEADERS_SESSION" 2>/dev/null || true
+  "$TMUX_BIN" kill-session -t cbridge-leaders-A 2>/dev/null || true
+  "$TMUX_BIN" kill-session -t cbridge-leaders-B 2>/dev/null || true
+  "$TMUX_BIN" kill-session -t cbridge-peers 2>/dev/null || true
+fi
+
+create_peer() {
+  local room="$1" cwd="$2" cmd pane
+  post_room "$room"
+  cmd="$(peer_cmd "$room" "$cwd")"
+  if ! "$TMUX_BIN" has-session -t cbridge-peers 2>/dev/null; then
+    pane="$("$TMUX_BIN" new-session -d -P -F '#{pane_id}' -s cbridge-peers -n "$room" -c "$cwd" "$cmd")"
+  elif ! "$TMUX_BIN" list-windows -t cbridge-peers -F '#{window_name}' | grep -qx "$room"; then
+    pane="$("$TMUX_BIN" new-window -d -P -F '#{pane_id}' -t cbridge-peers -n "$room" -c "$cwd" "$cmd")"
+  else
+    return 0
+  fi
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_room "$room" >/dev/null 2>&1 || true
+}
+
+leader_window_for_group() {
+  local group="$1"
+  case "$group" in
+    cbridge-leaders-A|A|"$LEADERS_SESSION:A") print -r -- A ;;
+    cbridge-leaders-B|B|"$LEADERS_SESSION:B") print -r -- B ;;
+    "$LEADERS_SESSION":*) print -r -- "${group#*:}" ;;
+    cbridge-leaders-*) print -r -- "${group#cbridge-leaders-}" ;;
+    "") print -r -- A ;;
+    *) print -r -- "$group" ;;
+  esac
+}
+
+create_leader_window() {
+  local window="$1"
+  typeset -a indexes
+  for (( i=1; i<=${#rooms[@]}; i++ )); do
+    [[ "$(leader_window_for_group "${room_groups[$i]}")" == "$window" ]] && indexes+=("$i")
+  done
+  (( ${#indexes[@]} == 0 )) && return
+  if "$TMUX_BIN" list-windows -t "$LEADERS_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$window"; then
+    log "$LEADERS_SESSION:$window already exists; skipping"
+    return 0
+  fi
+
+  local first="${indexes[1]}" room thread cwd cmd pane
+  room="${rooms[$first]}"; thread="${threads[$first]}"; cwd="${cwds[$first]}"
+  post_room "$room"
+  cmd="$(leader_cmd "$room" "$thread" "$cwd")"
+  if "$TMUX_BIN" has-session -t "$LEADERS_SESSION" 2>/dev/null; then
+    pane="$("$TMUX_BIN" new-window -d -P -F '#{pane_id}' -t "$LEADERS_SESSION" -n "$window" -c "$cwd" "$cmd")"
+  else
+    pane="$("$TMUX_BIN" new-session -d -x "$RESTORE_WIDTH" -y "$RESTORE_HEIGHT" -P -F '#{pane_id}' -s "$LEADERS_SESSION" -n "$window" -c "$cwd" "$cmd")"
+  fi
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_room "$room" >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_thread_id "$thread" >/dev/null 2>&1 || true
+
+  for (( j=2; j<=${#indexes[@]}; j++ )); do
+    idx="${indexes[$j]}"
+    room="${rooms[$idx]}"; thread="${threads[$idx]}"; cwd="${cwds[$idx]}"
+    post_room "$room"
+    cmd="$(leader_cmd "$room" "$thread" "$cwd")"
+    pane="$("$TMUX_BIN" split-window -d -P -F '#{pane_id}' -t "$LEADERS_SESSION:$window" -c "$cwd" "$cmd")"
+    "$TMUX_BIN" set-option -pt "$pane" @cbridge_room "$room" >/dev/null 2>&1 || true
+    "$TMUX_BIN" set-option -pt "$pane" @cbridge_thread_id "$thread" >/dev/null 2>&1 || true
+  done
+
+  case "${#indexes[@]}" in
+    1) ;;
+    2) "$TMUX_BIN" select-layout -t "$LEADERS_SESSION:$window" even-horizontal >/dev/null ;;
+    *) "$TMUX_BIN" select-layout -t "$LEADERS_SESSION:$window" tiled >/dev/null ;;
+  esac
+}
+
+configure_leader_tabs() {
+  "$TMUX_BIN" set-option -t "$LEADERS_SESSION" status off >/dev/null 2>&1 || true
+}
+
+leader_tab_session() {
+  local window="$1"
+  print -r -- "$LEADER_TAB_SESSION_PREFIX-$window"
+}
+
+ensure_leader_tab_session() {
+  local window="$1" tab_session
+  tab_session="$(leader_tab_session "$window")"
+  if ! "$TMUX_BIN" has-session -t "$tab_session" 2>/dev/null; then
+    "$TMUX_BIN" new-session -d -t "$LEADERS_SESSION" -s "$tab_session" >/dev/null 2>&1 || true
+  fi
+  "$TMUX_BIN" select-window -t "$tab_session:$window" >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -t "$tab_session" status off >/dev/null 2>&1 || true
+}
+
+ghostty_attach_cmd() {
+  local window="$1"
+  printf 'printf "\\033]0;cbridge %s\\007"; exec %s attach -t %s' \
+    "$window" "$(quote "$TMUX_BIN")" "$(quote "$(leader_tab_session "$window")")"
+}
+
+open_ghostty_native_tab() {
+  local window="$1"
+  /usr/bin/osascript - "$HOME_DIR" "cbridge $window" "$(ghostty_attach_cmd "$window")" <<'APPLESCRIPT'
+on run argv
+  set workDir to item 1 of argv
+  set tabTitle to item 2 of argv
+  set tabCommand to item 3 of argv
+  tell application "Ghostty"
+    set cfg to new surface configuration from {initial working directory:workDir, command:tabCommand}
+    set newTab to new tab in front window with configuration cfg
+    perform action ("set_tab_title:" & tabTitle) on focused terminal of newTab
+  end tell
+end run
+APPLESCRIPT
+}
+
+open_ghostty_leader_tabs() {
+  (( ${#leader_windows[@]} == 0 )) && return
+  typeset -a tab_args
+  local window
+  for window in "${leader_windows[@]}"; do
+    tab_args+=("cbridge $window" "$(ghostty_attach_cmd "$window")")
+  done
+  /usr/bin/osascript - "$HOME_DIR" "$GHOSTTY_TAB_DELAY" "${tab_args[@]}" <<'APPLESCRIPT'
+on run argv
+  set workDir to item 1 of argv
+  set tabDelay to (item 2 of argv) as real
+  tell application "Ghostty"
+    activate
+    set firstTitle to item 3 of argv
+    set firstCommand to item 4 of argv
+    set firstConfig to new surface configuration from {initial working directory:workDir, command:firstCommand}
+    set leaderWindow to new window with configuration firstConfig
+    perform action ("set_tab_title:" & firstTitle) on focused terminal of selected tab of leaderWindow
+    delay tabDelay
+    repeat with i from 5 to count argv by 2
+      set tabTitle to item i of argv
+      set tabCommand to item (i + 1) of argv
+      set cfg to new surface configuration from {initial working directory:workDir, command:tabCommand}
+      set newTab to new tab in leaderWindow with configuration cfg
+      perform action ("set_tab_title:" & tabTitle) on focused terminal of newTab
+      delay tabDelay
+    end repeat
+    activate window leaderWindow
+  end tell
+end run
+APPLESCRIPT
+}
+
+for (( i=1; i<=${#rooms[@]}; i++ )); do
+  create_peer "${rooms[$i]}" "${cwds[$i]}"
+done
+
+typeset -a leader_windows
+for (( i=1; i<=${#room_groups[@]}; i++ )); do
+  window="$(leader_window_for_group "${room_groups[$i]}")"
+  (( ${leader_windows[(Ie)$window]} == 0 )) && leader_windows+=("$window")
+done
+
+for window in "${leader_windows[@]}"; do
+  create_leader_window "$window"
+done
+configure_leader_tabs
+for window in "${leader_windows[@]}"; do
+  ensure_leader_tab_session "$window"
+done
+"$TMUX_BIN" set-option -gq @cbridge_next_leader_id 7 || true
+
+if [[ "$OPEN_WINDOWS" == "1" && -d "$GHOSTTY_APP" ]]; then
+  if "$TMUX_BIN" has-session -t "$LEADERS_SESSION" 2>/dev/null && ! pgrep -f "tmux attach -t $LEADER_TAB_SESSION_PREFIX-" >/dev/null 2>&1; then
+    open_ghostty_leader_tabs || true
+  fi
+fi
+
+log "restored ${#rooms[@]} leader rooms in $LEADERS_SESSION"

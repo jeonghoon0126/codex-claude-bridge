@@ -1,0 +1,686 @@
+#!/bin/zsh
+set -euo pipefail
+
+layout="${1:-}"
+target="${2:-}"
+active_pane="${3:-}"
+
+if [[ -z "$target" ]]; then
+  target="$(tmux display-message -p '#{session_name}:#{window_index}')"
+fi
+
+if [[ -n "$active_pane" ]]; then
+  active_header_for="$(tmux display-message -p -t "$active_pane" '#{@cbridge_header_for}' 2>/dev/null || true)"
+  if [[ -n "$active_header_for" ]]; then
+    active_pane="$active_header_for"
+  fi
+fi
+
+session_name="$(tmux display-message -p -t "$target" '#{session_name}' 2>/dev/null || true)"
+if [[ "$session_name" != cbridge-leaders-* ]]; then
+  tmux display-message "리더 레이아웃은 cbridge 리더 세션에서만 사용할 수 있습니다"
+  exit 0
+fi
+
+if [[ "$layout" != "4x1" && "$layout" != "2x2" && "$layout" != "leader-left" && "$layout" != "leader-right" && "$layout" != "leader-remove" ]]; then
+  tmux display-message "알 수 없는 리더 레이아웃: $layout"
+  exit 1
+fi
+
+window_width="$(tmux display-message -p -t "$target" '#{window_width}')"
+window_height="$(tmux display-message -p -t "$target" '#{window_height}')"
+header_height=2
+bridge_url="${CODEX_BRIDGE_URL:-http://localhost:8788}"
+bridge_dir="${0:A:h:h}"
+bridge_codex="${bridge_dir}/bridge-codex"
+bridge_peer="${bridge_dir}/bridge-codex-peer"
+
+typeset -A header_by_body
+typeset -A body_left
+typeset -A body_top
+typeset -A body_room
+typeset -A sidecar_room
+typeset -A leader_sidecar_origin
+typeset -A leader_sidecar_created
+typeset -A leader_sidecar_position
+typeset -A leader_sidecar_left
+typeset -A leader_sidecar_top
+body_ids=()
+sidecar_ids=()
+leader_sidecar_ids=()
+
+while IFS='|' read -r pane_id left top header_for room sidecar_peer sidecar_leader sidecar_origin sidecar_created sidecar_position; do
+  if [[ -n "$header_for" ]]; then
+    header_by_body[$header_for]="$pane_id"
+    continue
+  fi
+  if [[ "$sidecar_leader" == "1" || "$sidecar_created" == "1" ]]; then
+    leader_sidecar_ids+=("$pane_id")
+    leader_sidecar_origin[$pane_id]="$sidecar_origin"
+    leader_sidecar_created[$pane_id]="$sidecar_created"
+    leader_sidecar_position[$pane_id]="$sidecar_position"
+    leader_sidecar_left[$pane_id]="$left"
+    leader_sidecar_top[$pane_id]="$top"
+    continue
+  fi
+  if [[ "$sidecar_peer" == "1" ]]; then
+    sidecar_ids+=("$pane_id")
+    sidecar_room[$pane_id]="$room"
+    continue
+  fi
+  if [[ "$room" == LEADER-* ]]; then
+    body_ids+=("$pane_id")
+    body_left[$pane_id]="$left"
+    body_top[$pane_id]="$top"
+    body_room[$pane_id]="$room"
+  fi
+done < <(tmux list-panes -t "$target" -F '#{pane_id}|#{pane_left}|#{pane_top}|#{@cbridge_header_for}|#{@cbridge_room}|#{@cbridge_sidecar_peer}|#{@cbridge_sidecar_leader}|#{@cbridge_sidecar_origin}|#{@cbridge_sidecar_created}|#{@cbridge_sidecar_position}')
+
+if (( ${#body_ids[@]} > 4 )); then
+  excess_file="$(mktemp)"
+  for pane_id in "${body_ids[@]}"; do
+    printf '%08d\t%s\n' "${pane_id#%}" "$pane_id" >> "$excess_file"
+  done
+  keep_ids=("${(@f)$(sort -n -k1,1 "$excess_file" | head -n 4 | cut -f2)}")
+  excess_ids=("${(@f)$(sort -n -k1,1 "$excess_file" | tail -n +5 | cut -f2)}")
+  rm -f "$excess_file"
+
+  body_ids=("${keep_ids[@]}")
+  for pane_id in "${excess_ids[@]}"; do
+    leader_sidecar_ids+=("$pane_id")
+    leader_sidecar_created[$pane_id]="1"
+    leader_sidecar_position[$pane_id]="right"
+    leader_sidecar_left[$pane_id]="${body_left[$pane_id]-0}"
+    leader_sidecar_top[$pane_id]="${body_top[$pane_id]-0}"
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_leader 1 2>/dev/null || true
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_created 1 2>/dev/null || true
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_position right 2>/dev/null || true
+  done
+fi
+
+if (( ${#body_ids[@]} != 4 )); then
+  tmux display-message "리더 레이아웃에는 리더 pane 4개가 필요합니다. 현재 ${#body_ids[@]}개"
+  exit 1
+fi
+
+has_all_headers=1
+for pane_id in "${body_ids[@]}"; do
+  if [[ -z "${header_by_body[$pane_id]-}" ]]; then
+    has_all_headers=0
+    break
+  fi
+done
+
+tmp_file="$(mktemp)"
+trap 'rm -f "$tmp_file"' EXIT
+for pane_id in "${body_ids[@]}"; do
+  printf '%s\t%s\t%s\n' "${body_top[$pane_id]}" "${body_left[$pane_id]}" "$pane_id" >> "$tmp_file"
+done
+
+ordered_body_ids=("${(@f)$(sort -n -k1,1 -k2,2 "$tmp_file" | cut -f3)}")
+
+if (( ! has_all_headers )) && [[ "$layout" == "4x1" || "$layout" == "2x2" ]] && (( ${#sidecar_ids[@]} == 0 && ${#leader_sidecar_ids[@]} == 0 )); then
+  if [[ "$layout" == "4x1" ]]; then
+    tmux select-layout -t "$target" even-horizontal
+  else
+    tmux select-layout -t "$target" tiled
+  fi
+  if [[ -n "$active_pane" ]]; then
+    tmux select-pane -t "$active_pane" 2>/dev/null || true
+  fi
+  tmux display-message -t "$target" "리더 레이아웃: $layout"
+  exit 0
+fi
+
+pane_number() {
+  print -r -- "${1#%}"
+}
+
+checksum() {
+  perl -e '
+    my $s = shift;
+    my $c = 0;
+    for my $ch (split //, $s) {
+      $c = (($c >> 1) + (($c & 1) << 15) + ord($ch)) & 0xffff;
+    }
+    printf "%04x", $c;
+  ' "$1"
+}
+
+distribute_with_separators() {
+  local total="$1"
+  local count="$2"
+  local available=$(( total - count + 1 ))
+  local base=$(( available / count ))
+  local remainder=$(( available % count ))
+  local i
+  for (( i = 0; i < count; i++ )); do
+    if (( i < remainder )); then
+      print $(( base + 1 ))
+    else
+      print $base
+    fi
+  done
+}
+
+distribute_plain() {
+  local total="$1"
+  local count="$2"
+  local base=$(( total / count ))
+  local remainder=$(( total % count ))
+  local i
+  for (( i = 0; i < count; i++ )); do
+    if (( i < remainder )); then
+      print $(( base + 1 ))
+    else
+      print $base
+    fi
+  done
+}
+
+pane_room() {
+  tmux display-message -p -t "$1" '#{@cbridge_room}' 2>/dev/null || true
+}
+
+shell_quote() {
+  printf "%q" "$1"
+}
+
+post_bridge_room() {
+  local room="$1"
+  curl -fsS -X POST \
+    -H 'content-type: application/json' \
+    --data '{}' \
+    "${bridge_url}/api/rooms/${room}" >/dev/null 2>&1 || true
+}
+
+delete_bridge_room() {
+  local room="$1"
+  curl -fsS -X DELETE "${bridge_url}/api/rooms/${room}" >/dev/null 2>&1 || true
+}
+
+next_leader_rooms() {
+  local used_file
+  used_file="$(mktemp)"
+  {
+    tmux list-panes -a -F '#{@cbridge_room}' 2>/dev/null || true
+    tmux list-windows -t cbridge-peers -F '#{window_name}' 2>/dev/null || true
+    curl -fsS "${bridge_url}/api/rooms" 2>/dev/null | grep -o 'LEADER-[0-9]\+' || true
+  } | sed -n 's/^LEADER-\([0-9][0-9]*\)$/\1/p' > "$used_file"
+
+  local max_id
+  max_id="$(sort -n "$used_file" | tail -n 1)"
+  rm -f "$used_file"
+  if [[ -z "$max_id" ]]; then
+    max_id=0
+  fi
+
+  local next_id
+  next_id="$(tmux show-option -gqv @cbridge_next_leader_id 2>/dev/null || true)"
+  if [[ -z "$next_id" || "$next_id" != <-> || "$next_id" -le "$max_id" ]]; then
+    next_id=$(( max_id + 1 ))
+  fi
+
+  print -r -- "LEADER-${next_id}"
+  print -r -- "LEADER-$(( next_id + 1 ))"
+  tmux set-option -gq @cbridge_next_leader_id "$(( next_id + 2 ))" 2>/dev/null || true
+}
+
+peer_window_target_for_room() {
+  local room="$1"
+  while IFS='|' read -r window_index window_name; do
+    if [[ "$window_name" == "$room" ]]; then
+      print -r -- "cbridge-peers:${window_index}"
+      return 0
+    fi
+  done < <(tmux list-windows -t cbridge-peers -F '#{window_index}|#{window_name}' 2>/dev/null || true)
+  return 1
+}
+
+ensure_peer_session() {
+  if ! tmux has-session -t cbridge-peers 2>/dev/null; then
+    tmux new-session -d -s cbridge-peers
+  fi
+}
+
+create_background_peer_window() {
+  local room="$1"
+  local workdir="$2"
+  local peer_cmd="CODEX_BRIDGE_CWD=$(shell_quote "$workdir") CODEX_PEER_CWD=$(shell_quote "$workdir") $(shell_quote "$bridge_peer") $(shell_quote "$room")"
+  local peer_pane=""
+
+  if tmux has-session -t cbridge-peers 2>/dev/null; then
+    peer_pane="$(tmux new-window -d -P -F '#{pane_id}' -t cbridge-peers -n "$room" -c "$workdir" "$peer_cmd" 2>/dev/null || true)"
+  else
+    peer_pane="$(tmux new-session -d -P -F '#{pane_id}' -s cbridge-peers -n "$room" -c "$workdir" "$peer_cmd" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$peer_pane" ]]; then
+    tmux set-option -pt "$peer_pane" @cbridge_room "$room" 2>/dev/null || true
+  fi
+}
+
+kill_background_peer_window() {
+  local room="$1"
+  while IFS='|' read -r window_index window_name; do
+    [[ "$window_name" == "$room" ]] || continue
+    tmux kill-window -t "cbridge-peers:${window_index}" 2>/dev/null || true
+  done < <(tmux list-windows -t cbridge-peers -F '#{window_index}|#{window_name}' 2>/dev/null || true)
+}
+
+create_leader_pane() {
+  local room="$1"
+  local anchor="$2"
+  local before="$3"
+  local workdir="$4"
+  local leader_cmd="CODEX_BRIDGE_CWD=$(shell_quote "$workdir") $(shell_quote "$bridge_codex") $(shell_quote "$room")"
+  local args=(-d -P -F '#{pane_id}' -t "$anchor" -c "$workdir")
+  if [[ "$before" == "1" ]]; then
+    args+=(-b)
+  fi
+
+  post_bridge_room "$room"
+  create_background_peer_window "$room" "$workdir"
+
+  local pane_id
+  pane_id="$(tmux split-window "${args[@]}" "$leader_cmd")"
+  tmux set-option -pt "$pane_id" @cbridge_room "$room" 2>/dev/null || true
+  tmux set-option -pt "$pane_id" @cbridge_sidecar_leader 1 2>/dev/null || true
+  tmux set-option -pt "$pane_id" @cbridge_sidecar_created 1 2>/dev/null || true
+  tmux set-option -pt "$pane_id" @cbridge_sidecar_position '' 2>/dev/null || true
+  tmux set-option -pt "$pane_id" @cbridge_sidecar_origin '' 2>/dev/null || true
+  tmux set-option -pt "$pane_id" @cbridge_border_title "#[fg=colour14,bold]${room} #[fg=colour245]│ #[fg=colour229,bold]새 리더 세션" 2>/dev/null || true
+  print -r -- "$pane_id"
+}
+
+find_background_peer_pane() {
+  local room="$1"
+  while IFS='|' read -r session_name pane_id header_for pane_room sidecar_peer; do
+    [[ "$pane_room" == "$room" ]] || continue
+    [[ -z "$header_for" ]] || continue
+    [[ "$sidecar_peer" != "1" ]] || continue
+    [[ "$session_name" != cbridge-leaders-* ]] || continue
+    print -r -- "$pane_id"
+    return 0
+  done < <(tmux list-panes -a -F '#{session_name}|#{pane_id}|#{@cbridge_header_for}|#{@cbridge_room}|#{@cbridge_sidecar_peer}' 2>/dev/null || true)
+  return 1
+}
+
+return_peer_sidecar() {
+  local pane_id="$1"
+  local room="${sidecar_room[$pane_id]-}"
+  if [[ -z "$room" ]]; then
+    room="$(pane_room "$pane_id")"
+  fi
+  if [[ -z "$room" ]]; then
+    return 1
+  fi
+
+  ensure_peer_session
+  local dest
+  dest="$(peer_window_target_for_room "$room" || true)"
+  local placeholder=""
+  if [[ -z "$dest" ]]; then
+    placeholder="$(tmux new-window -d -P -F '#{pane_id}' -t cbridge-peers -n "$room" 2>/dev/null || true)"
+    local window_index
+    window_index="$(tmux display-message -p -t "$placeholder" '#{window_index}' 2>/dev/null || true)"
+    if [[ -n "$window_index" ]]; then
+      dest="cbridge-peers:${window_index}"
+    fi
+  fi
+  if [[ -z "$dest" ]]; then
+    return 1
+  fi
+
+  tmux set-option -pt "$pane_id" @cbridge_sidecar_peer 0 2>/dev/null || true
+  tmux set-option -pt "$pane_id" @cbridge_sidecar_position '' 2>/dev/null || true
+  tmux join-pane -d -s "$pane_id" -t "$dest" 2>/dev/null || return 1
+  if [[ -n "$placeholder" ]]; then
+    tmux kill-pane -t "$placeholder" 2>/dev/null || true
+  fi
+  tmux select-layout -t "$dest" even-vertical 2>/dev/null || true
+  return 0
+}
+
+return_all_sidecars() {
+  local removed=0
+  local pane_id
+  for pane_id in "${sidecar_ids[@]}"; do
+    if return_peer_sidecar "$pane_id"; then
+      removed=$(( removed + 1 ))
+    fi
+  done
+  print -r -- "$removed"
+}
+
+return_leader_sidecar() {
+  local pane_id="$1"
+  local room
+  room="$(pane_room "$pane_id")"
+  local created="${leader_sidecar_created[$pane_id]-}"
+  if [[ -z "$created" ]]; then
+    created="$(tmux display-message -p -t "$pane_id" '#{@cbridge_sidecar_created}' 2>/dev/null || true)"
+  fi
+  if [[ "$created" == "1" ]]; then
+    if [[ -n "$room" ]]; then
+      kill_background_peer_window "$room"
+      delete_bridge_room "$room"
+    fi
+    tmux kill-pane -t "$pane_id" 2>/dev/null || return 1
+    return 0
+  fi
+
+  local origin="${leader_sidecar_origin[$pane_id]-}"
+  if [[ -z "$origin" ]]; then
+    origin="$(tmux display-message -p -t "$pane_id" '#{@cbridge_sidecar_origin}' 2>/dev/null || true)"
+  fi
+  if [[ -z "$origin" ]]; then
+    return 1
+  fi
+
+  tmux set-option -pt "$pane_id" @cbridge_sidecar_leader 0 2>/dev/null || true
+  tmux set-option -pt "$pane_id" @cbridge_sidecar_created 0 2>/dev/null || true
+  tmux set-option -pt "$pane_id" @cbridge_sidecar_position '' 2>/dev/null || true
+  tmux set-option -pt "$pane_id" @cbridge_sidecar_origin '' 2>/dev/null || true
+  tmux join-pane -d -s "$pane_id" -t "$origin" 2>/dev/null || return 1
+  tmux select-layout -t "$origin" tiled 2>/dev/null || true
+  return 0
+}
+
+return_all_leader_sidecars() {
+  local removed=0
+  local pane_id
+  for pane_id in "${leader_sidecar_ids[@]}"; do
+    if return_leader_sidecar "$pane_id"; then
+      removed=$(( removed + 1 ))
+    fi
+  done
+  print -r -- "$removed"
+}
+
+header_for() {
+  local body_id="$1"
+  local header_id="${header_by_body[$body_id]-}"
+  if [[ -z "$header_id" ]]; then
+    tmux display-message "리더 pane ${body_room[$body_id]}의 제목 헤더가 없습니다"
+    exit 1
+  fi
+  print -r -- "$header_id"
+}
+
+column_pair() {
+  local width="$1"
+  local x="$2"
+  local body_id="$3"
+  local header_id
+  header_id="$(header_for "$body_id")"
+  local body_height=$(( window_height - header_height - 1 ))
+  print -r -- "${width}x${window_height},${x},0[${width}x${header_height},${x},0,$(pane_number "$header_id"),${width}x${body_height},${x},$(( header_height + 1 )),$(pane_number "$body_id")]"
+}
+
+column_two_pairs() {
+  local width="$1"
+  local x="$2"
+  local top_body_id="$3"
+  local bottom_body_id="$4"
+  local top_header_id
+  local bottom_header_id
+  top_header_id="$(header_for "$top_body_id")"
+  bottom_header_id="$(header_for "$bottom_body_id")"
+
+  local total_body_height=$(( window_height - header_height * 2 - 3 ))
+  local body_heights=("${(@f)$(distribute_plain "$total_body_height" 2)}")
+  local top_body_height="${body_heights[1]}"
+  local bottom_body_height="${body_heights[2]}"
+  local top_body_y=$(( header_height + 1 ))
+  local bottom_header_y=$(( top_body_y + top_body_height + 1 ))
+  local bottom_body_y=$(( bottom_header_y + header_height + 1 ))
+
+  print -r -- "${width}x${window_height},${x},0[${width}x${header_height},${x},0,$(pane_number "$top_header_id"),${width}x${top_body_height},${x},${top_body_y},$(pane_number "$top_body_id"),${width}x${header_height},${x},${bottom_header_y},$(pane_number "$bottom_header_id"),${width}x${bottom_body_height},${x},${bottom_body_y},$(pane_number "$bottom_body_id")]"
+}
+
+leader_row_plain() {
+  local width="$1"
+  local x="$2"
+  local y="$3"
+  local height="$4"
+  local left_body_id="$5"
+  local right_body_id="$6"
+  local col_widths=("${(@f)$(distribute_with_separators "$width" 2)}")
+  local right_x=$(( x + col_widths[1] + 1 ))
+  print -r -- "${width}x${height},${x},${y}{${col_widths[1]}x${height},${x},${y},$(pane_number "$left_body_id"),${col_widths[2]}x${height},${right_x},${y},$(pane_number "$right_body_id")}"
+}
+
+leader_grid_2x2_plain() {
+  local width="$1"
+  local x="$2"
+  local row_heights=("${(@f)$(distribute_with_separators "$window_height" 2)}")
+  local top_row
+  local bottom_row
+  top_row="$(leader_row_plain "$width" "$x" 0 "${row_heights[1]}" "${ordered_body_ids[1]}" "${ordered_body_ids[2]}")"
+  local bottom_y=$(( row_heights[1] + 1 ))
+  bottom_row="$(leader_row_plain "$width" "$x" "$bottom_y" "${row_heights[2]}" "${ordered_body_ids[3]}" "${ordered_body_ids[4]}")"
+  print -r -- "${width}x${window_height},${x},0[${top_row},${bottom_row}]"
+}
+
+side_column_two_rows_plain() {
+  local width="$1"
+  local x="$2"
+  local top_pane="$3"
+  local bottom_pane="${4:-}"
+  if [[ -z "$bottom_pane" ]]; then
+    print -r -- "${width}x${window_height},${x},0,$(pane_number "$top_pane")"
+    return 0
+  fi
+  local row_heights=("${(@f)$(distribute_with_separators "$window_height" 2)}")
+  local bottom_y=$(( row_heights[1] + 1 ))
+  print -r -- "${width}x${window_height},${x},0[${width}x${row_heights[1]},${x},0,$(pane_number "$top_pane"),${width}x${row_heights[2]},${x},${bottom_y},$(pane_number "$bottom_pane")]"
+}
+
+sidecar_pairs_for_position() {
+  local position="$1"
+  local panes_file
+  panes_file="$(mktemp)"
+
+  local main_left="${body_left[${ordered_body_ids[1]}]-0}"
+  local pane_id pane_position pane_left pane_top
+  for pane_id in "${leader_sidecar_ids[@]}"; do
+    pane_position="${leader_sidecar_position[$pane_id]-}"
+    if [[ -z "$pane_position" ]]; then
+      pane_position="$(tmux display-message -p -t "$pane_id" '#{@cbridge_sidecar_position}' 2>/dev/null || true)"
+    fi
+    if [[ -z "$pane_position" ]]; then
+      pane_left="${leader_sidecar_left[$pane_id]-0}"
+      if (( pane_left < main_left )); then
+        pane_position="left"
+      else
+        pane_position="right"
+      fi
+    fi
+    [[ "$pane_position" == "$position" ]] || continue
+    pane_top="${leader_sidecar_top[$pane_id]-0}"
+    printf '%08d\t%08d\t%s\n' "${pane_id#%}" "$pane_top" "$pane_id" >> "$panes_file"
+  done
+
+  if [[ ! -s "$panes_file" ]]; then
+    rm -f "$panes_file"
+    return 0
+  fi
+
+  local -a panes
+  panes=("${(@f)$(sort -n -k1,1 "$panes_file" | cut -f3)}")
+  rm -f "$panes_file"
+
+  local i
+  for (( i = 1; i <= ${#panes[@]}; i += 2 )); do
+    print -r -- "${panes[$i]}|${panes[$(( i + 1 ))]-}"
+  done
+}
+
+apply_leader_sidecar_layout() {
+  if (( has_all_headers )); then
+    tmux display-message -t "$target" "리더 열 추가는 border-title 리더 pane에서만 사용할 수 있습니다"
+    exit 1
+  fi
+
+  local -a left_pairs
+  local -a right_pairs
+  local pair
+  left_pairs=()
+  right_pairs=()
+  while IFS= read -r pair; do
+    [[ -n "$pair" ]] && left_pairs+=("$pair")
+  done < <(sidecar_pairs_for_position left)
+  while IFS= read -r pair; do
+    [[ -n "$pair" ]] && right_pairs+=("$pair")
+  done < <(sidecar_pairs_for_position right)
+
+  local side_count=$(( ${#left_pairs[@]} + ${#right_pairs[@]} ))
+  if (( side_count == 0 )); then
+    tmux display-message -t "$target" "생성된 리더 열이 없습니다"
+    exit 1
+  fi
+
+  local side_width=$(( window_width / (side_count + 3) ))
+  if (( side_width < 32 )); then side_width=32; fi
+  if (( side_width > 96 )); then side_width=96; fi
+  local main_width=$(( window_width - side_count * side_width - side_count ))
+  if (( main_width < 64 )); then
+    side_width=$(( (window_width - 64 - side_count) / side_count ))
+    if (( side_width < 24 )); then
+      tmux display-message -t "$target" "창이 너무 좁아 리더 열을 추가할 수 없습니다"
+      exit 1
+    fi
+    main_width=$(( window_width - side_count * side_width - side_count ))
+  fi
+
+  local -a columns
+  local x=0
+  local top_pane bottom_pane
+  columns=()
+  for pair in "${left_pairs[@]}"; do
+    top_pane="${pair%%|*}"
+    bottom_pane="${pair#*|}"
+    columns+=("$(side_column_two_rows_plain "$side_width" "$x" "$top_pane" "$bottom_pane")")
+    x=$(( x + side_width + 1 ))
+  done
+  columns+=("$(leader_grid_2x2_plain "$main_width" "$x")")
+  x=$(( x + main_width + 1 ))
+  for pair in "${right_pairs[@]}"; do
+    top_pane="${pair%%|*}"
+    bottom_pane="${pair#*|}"
+    columns+=("$(side_column_two_rows_plain "$side_width" "$x" "$top_pane" "$bottom_pane")")
+    x=$(( x + side_width + 1 ))
+  done
+  layout_body="${window_width}x${window_height},0,0{${(j:,:)columns}}"
+
+  layout_checksum="$(checksum "$layout_body")"
+  tmux select-layout -t "$target" "${layout_checksum},${layout_body}"
+}
+
+if [[ "$layout" == "leader-remove" ]]; then
+  removed="$(return_all_leader_sidecars)"
+  if [[ -n "$active_pane" ]]; then
+    tmux select-pane -t "$active_pane" 2>/dev/null || tmux select-pane -t "${ordered_body_ids[1]}" 2>/dev/null || true
+  fi
+  tmux select-layout -t "$target" tiled 2>/dev/null || true
+  tmux display-message -t "$target" "생성한 리더 열 삭제: ${removed}개"
+  exit 0
+fi
+
+if [[ "$layout" == "leader-left" || "$layout" == "leader-right" ]]; then
+  if [[ -z "$active_pane" ]]; then
+    tmux display-message -t "$target" "먼저 리더 pane을 선택하세요"
+    exit 1
+  fi
+  active_room="$(pane_room "$active_pane")"
+  if [[ "$active_room" != LEADER-* ]]; then
+    tmux display-message -t "$target" "리더 열을 추가하려면 LEADER pane을 선택하세요"
+    exit 1
+  fi
+
+  position="${layout#leader-}"
+  return_all_sidecars >/dev/null || true
+  active_workdir="$(tmux display-message -p -t "$active_pane" '#{pane_current_path}' 2>/dev/null || true)"
+  if [[ -z "$active_workdir" || ! -d "$active_workdir" ]]; then
+    active_workdir="${HOME:-/Users/wjh}"
+  fi
+
+  leader_rooms=("${(@f)$(next_leader_rooms)}")
+  top_leader_room="${leader_rooms[1]}"
+  bottom_leader_room="${leader_rooms[2]}"
+
+  if [[ "$position" == "left" ]]; then
+    top_leader_pane="$(create_leader_pane "$top_leader_room" "${ordered_body_ids[1]}" 1 "$active_workdir")"
+    bottom_leader_pane="$(create_leader_pane "$bottom_leader_room" "$top_leader_pane" 0 "$active_workdir")"
+  else
+    top_leader_pane="$(create_leader_pane "$top_leader_room" "${ordered_body_ids[4]}" 0 "$active_workdir")"
+    bottom_leader_pane="$(create_leader_pane "$bottom_leader_room" "$top_leader_pane" 0 "$active_workdir")"
+  fi
+
+  tmux set-option -pt "$top_leader_pane" @cbridge_sidecar_position "$position" 2>/dev/null || true
+  tmux set-option -pt "$bottom_leader_pane" @cbridge_sidecar_position "$position" 2>/dev/null || true
+  leader_sidecar_ids+=("$top_leader_pane" "$bottom_leader_pane")
+  leader_sidecar_created[$top_leader_pane]="1"
+  leader_sidecar_created[$bottom_leader_pane]="1"
+  leader_sidecar_position[$top_leader_pane]="$position"
+  leader_sidecar_position[$bottom_leader_pane]="$position"
+  leader_sidecar_left[$top_leader_pane]="0"
+  leader_sidecar_left[$bottom_leader_pane]="0"
+  leader_sidecar_top[$top_leader_pane]="0"
+  leader_sidecar_top[$bottom_leader_pane]="1"
+
+  apply_leader_sidecar_layout
+  tmux select-pane -t "$active_pane" 2>/dev/null || true
+  if [[ "$position" == "left" ]]; then
+    tmux display-message -t "$target" "리더 레이아웃: ${top_leader_room}, ${bottom_leader_room} 왼쪽 생성"
+  else
+    tmux display-message -t "$target" "리더 레이아웃: ${top_leader_room}, ${bottom_leader_room} 오른쪽 생성"
+  fi
+  exit 0
+fi
+
+if (( ${#leader_sidecar_ids[@]} > 0 )); then
+  return_all_leader_sidecars >/dev/null || true
+fi
+
+if (( ${#sidecar_ids[@]} > 0 )); then
+  return_all_sidecars >/dev/null || true
+fi
+
+if (( ! has_all_headers )) && [[ "$layout" == "4x1" || "$layout" == "2x2" ]]; then
+  if [[ "$layout" == "4x1" ]]; then
+    tmux select-layout -t "$target" even-horizontal
+  else
+    tmux select-layout -t "$target" tiled
+  fi
+  if [[ -n "$active_pane" ]]; then
+    tmux select-pane -t "$active_pane" 2>/dev/null || true
+  fi
+  tmux display-message -t "$target" "리더 레이아웃: $layout"
+  exit 0
+fi
+
+if [[ "$layout" == "4x1" ]]; then
+  widths=("${(@f)$(distribute_with_separators "$window_width" 4)}")
+  columns=()
+  x=0
+  for i in 1 2 3 4; do
+    columns+=("$(column_pair "${widths[$i]}" "$x" "${ordered_body_ids[$i]}")")
+    x=$(( x + widths[$i] + 1 ))
+  done
+  layout_body="${window_width}x${window_height},0,0{${(j:,:)columns}}"
+else
+  widths=("${(@f)$(distribute_with_separators "$window_width" 2)}")
+  left_col="$(column_two_pairs "${widths[1]}" 0 "${ordered_body_ids[1]}" "${ordered_body_ids[3]}")"
+  right_x=$(( widths[1] + 1 ))
+  right_col="$(column_two_pairs "${widths[2]}" "$right_x" "${ordered_body_ids[2]}" "${ordered_body_ids[4]}")"
+  layout_body="${window_width}x${window_height},0,0{${left_col},${right_col}}"
+fi
+
+layout_checksum="$(checksum "$layout_body")"
+tmux select-layout -t "$target" "${layout_checksum},${layout_body}"
+if [[ -n "$active_pane" ]]; then
+  tmux select-pane -t "$active_pane" 2>/dev/null || true
+fi
+tmux display-message -t "$target" "리더 레이아웃: $layout"

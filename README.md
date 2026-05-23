@@ -72,10 +72,10 @@ Add to `~/.codex/config.toml`:
 [mcp_servers.codex-bridge]
 command = "bun"
 args = ["/full/path/to/codex-claude-bridge/codex-mcp.ts"]
-tool_timeout_sec = 120
+tool_timeout_sec = 3600
 ```
 
-`tool_timeout_sec = 120` is required — `send_to_claude` can wait up to 2 minutes for Claude's reply.
+`tool_timeout_sec = 3600` is required — `send_to_claude` can wait up to 60 minutes for Claude's reply.
 
 ---
 
@@ -189,9 +189,126 @@ Legacy `server.ts` is kept for reference — it combined the HTTP server and Cla
 ```bash
 bun run bridge       # covering-bridge CLI (room manager)
 bun run server       # bridge-server (central HTTP server)
+bun run web          # Phone browser -> Codex app-server bridge
+bun run web:tunnel   # Create a temporary public URL and run phone browser bridge
+bun run web:vpn      # Run phone browser bridge on the Tailscale/VPN interface
+bun run web:cf:setup # Create Cloudflare named tunnel config and DNS route
+bun run web:cloudflare # Run the Cloudflare Access hardened web bridge
+bun run sms          # Twilio SMS -> Codex app-server bridge
+bun run sms:tunnel   # Create a temporary public URL and run SMS bridge
+bun run sms:configure # Point the Twilio number at CODEX_SMS_PUBLIC_URL
 bun run claude-mcp   # claude-mcp.ts (set CODEX_BRIDGE_ROOM first)
 bun run codex-mcp    # codex-mcp.ts (set CODEX_BRIDGE_ROOM first)
 ```
+
+---
+
+## Mobile Web to Codex
+
+`codex-mobile-web.ts` exposes a token-protected phone browser UI for Codex app-server.
+It supports prompt input, live agent output, one active Codex thread, and YES/NO approval buttons.
+
+Run:
+
+```bash
+bun run web:tunnel
+```
+
+Open the printed `Mobile Codex URL` on the phone. The URL includes a random `token` query parameter.
+
+For VPN-only access, install and enable Tailscale on the Mac and phone, then run:
+
+```bash
+bun run web:vpn
+```
+
+Open the printed `Mobile Codex VPN URL` while the phone VPN is connected. This avoids exposing a public Cloudflare tunnel.
+
+Optional environment:
+
+```text
+CODEX_WEB_PORT=8791
+CODEX_WEB_HOST=127.0.0.1
+CODEX_WEB_TOKEN=long-random-token
+CODEX_WEB_PIN=123456
+CODEX_WEB_CWD=/Users/wjh
+CODEX_WEB_MODEL=gpt-5.5
+CODEX_WEB_HOSTNAME=codex.example.com
+CODEX_WEB_TUNNEL_NAME=codex-mobile-web
+CODEX_WEB_IDLE_TIMEOUT_MS=1800000
+CODEX_WEB_ABSOLUTE_TIMEOUT_MS=28800000
+CODEX_WEB_REQUIRE_CF_ACCESS=true
+CODEX_WEB_ALLOWED_CF_EMAILS=you@example.com
+CODEX_WEB_ALLOWED_CLIENT_CIDRS=203.0.113.10/32,203.0.113.0/24,2001:db8:1234::/48
+```
+
+Security defaults:
+
+- The token link is only used to bootstrap a browser session; APIs require an HttpOnly cookie.
+- Login requires `CODEX_WEB_PIN`; approvals require re-entering the PIN.
+- State-changing APIs require a CSRF token and are rate-limited.
+- Sessions expire after idle and absolute timeouts.
+- `/health` is also kept behind the configured Cloudflare/IP policy and only returns a minimal status.
+- Prompt, input, approval, login, logout, and expiry events are written to `~/.codex-mobile-web/audit.jsonl`.
+
+Recommended hardened flow:
+
+```text
+phone browser
+  -> Cloudflare Access app on a fixed domain
+  -> Google login policy
+  -> company VPN egress IP policy
+  -> cloudflared named tunnel
+  -> local Codex web app
+```
+
+When using Cloudflare Access, set `CODEX_WEB_REQUIRE_CF_ACCESS=true`, restrict `CODEX_WEB_ALLOWED_CF_EMAILS`, and set `CODEX_WEB_ALLOWED_CLIENT_CIDRS` to the company VPN public egress CIDR. IPv4 and IPv6 CIDRs are supported. The local app checks Cloudflare Access headers again before allowing token/PIN login.
+
+After a domain is connected to Cloudflare:
+
+```bash
+cloudflared tunnel login
+bun run web:cf:setup codex.example.com
+bun run web:cloudflare
+```
+
+In Cloudflare Zero Trust, create a Self-hosted Access application for the same hostname and add policies for Google login plus the company VPN egress IP range.
+
+---
+
+## SMS to Codex
+
+`twilio-codex-sms.ts` lets an allowlisted phone send prompts into Codex app-server.
+It starts Codex app-server over stdio, keeps one Codex thread per phone number, and sends final results back by SMS.
+
+Run:
+
+```bash
+cp sms.env.example .env.sms
+bun run sms:tunnel
+bun run sms:configure
+```
+
+Twilio webhook:
+
+```text
+POST https://your-domain.example.com/twilio/sms
+```
+
+SMS controls:
+
+```text
+/status  current session state
+/new     start a fresh Codex thread
+YES      approve a pending command or file change
+NO       decline a pending command or file change
+```
+
+Security defaults:
+
+- `CODEX_SMS_ALLOWED_FROM` is required. Any other sender gets a rejection message.
+- Twilio request signatures are checked unless `CODEX_SMS_SKIP_TWILIO_SIGNATURE=true`.
+- Outbound SMS uses Twilio REST credentials. With missing credentials, replies are logged instead of sent.
 
 ---
 

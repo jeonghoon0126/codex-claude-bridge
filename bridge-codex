@@ -6,6 +6,8 @@
 #   bridge-codex ENG-1234
 
 ROOM="${1}"
+WORKDIR="${CODEX_BRIDGE_CWD:-$PWD}"
+CODEX_BIN="${CODEX_BIN:-/Users/wjh/.local/bin/codex}"
 
 if [ -z "$ROOM" ]; then
   echo "usage: bridge-codex <ROOM_ID>" >&2
@@ -14,4 +16,8 @@ if [ -z "$ROOM" ]; then
 fi
 
 printf "%s" "$ROOM" > "/tmp/codex-bridge-room-$$"
-exec codex --full-auto
+printf "\033]0;LEADER-%s\007" "$ROOM"
+export CODEX_BRIDGE_ROOM="$ROOM"
+cd "$WORKDIR" || exit 1
+/Users/wjh/.bun/bin/bun /Users/wjh/codex-claude-bridge/covering-bridge.ts tmux-pane-titles --start >/dev/null 2>&1 || true
+exec "$CODEX_BIN" --sandbox danger-full-access -a never

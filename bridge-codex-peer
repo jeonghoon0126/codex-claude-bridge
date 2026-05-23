@@ -1,0 +1,22 @@
+#!/bin/sh
+# bridge-codex-peer <ROOM_ID>
+# 두 번째 Codex app-server를 Codex Bridge 응답자 쪽에 연결한다.
+#
+# Usage:
+#   bridge-codex-peer ENG-1234
+
+ROOM="${1}"
+WORKDIR="${CODEX_PEER_CWD:-${CODEX_BRIDGE_CWD:-$PWD}}"
+BUN_BIN="${BUN_BIN:-/Users/wjh/.bun/bin/bun}"
+
+if [ -z "$ROOM" ]; then
+  echo "usage: bridge-codex-peer <ROOM_ID>" >&2
+  echo "  e.g. bridge-codex-peer ENG-1234" >&2
+  exit 1
+fi
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+printf "%s" "$ROOM" > "/tmp/claude-bridge-room-$$"
+export CODEX_BRIDGE_ROOM="$ROOM"
+cd "$WORKDIR" || exit 1
+exec "$BUN_BIN" "$SCRIPT_DIR/codex-peer-agent.ts"
