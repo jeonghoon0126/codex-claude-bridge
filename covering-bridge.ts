@@ -5,13 +5,14 @@
 
 import { createInterface } from 'readline'
 import { spawnSync } from 'child_process'
-import { readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
 import { ROLE_TEMPLATES, TEMPLATE_KEYS } from './role-templates.ts'
 
 const BRIDGE_URL = process.env.CODEX_BRIDGE_URL ?? 'http://localhost:8788'
 const BRIDGE_DIR = new URL('.', import.meta.url).pathname
 const SELF_PATH = new URL(import.meta.url).pathname
 const TMUX_LAYOUT_SCRIPT = `${BRIDGE_DIR}scripts/cbridge-tmux-layout`
+const CBRIDGE_FOCUS_SCRIPT = `${BRIDGE_DIR}scripts/cbridge-focus-room`
 const VERSION = 'v0.4'
 const PAIR_MODE = process.env.CODEX_BRIDGE_PAIR === 'codex-codex' ? 'codex-codex' : 'codex-claude'
 const RESPONDER_LABEL = PAIR_MODE === 'codex-codex' ? 'codex-peer' : 'claude'
@@ -674,6 +675,56 @@ function tmuxOutput(args: string[]): string {
   }
 }
 
+function executablePath(name: string, candidates: string[]): string | undefined {
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate
+  }
+  try {
+    const found = spawnSync('/bin/zsh', ['-lc', `command -v ${shellQuote(name)} || true`], { encoding: 'utf8' })
+      .stdout
+      ?.trim()
+    return found || undefined
+  } catch {
+    return undefined
+  }
+}
+
+function appleScriptString(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+function notifyLeaderCompletion(pane: TmuxPane, roomId: string): void {
+  if (process.env.CBRIDGE_MAC_NOTIFY === '0') return
+  if (!/^LEADER-\d+$/i.test(roomId)) return
+
+  const title = 'Codex Bridge'
+  const subtitle = `${roomId} 답변 완료`
+  const message = `${pane.windowName} 창 ${pane.displayIndex}번 대화`
+  const focusCommand = `${shellQuote(CBRIDGE_FOCUS_SCRIPT)} ${shellQuote(roomId)}`
+  const terminalNotifier = executablePath('terminal-notifier', [
+    '/opt/homebrew/bin/terminal-notifier',
+    '/usr/local/bin/terminal-notifier',
+  ])
+
+  if (terminalNotifier) {
+    spawnSync(terminalNotifier, [
+      '-title', title,
+      '-subtitle', subtitle,
+      '-message', message,
+      '-group', `cbridge-${roomId}`,
+      '-execute', focusCommand,
+    ], { stdout: 'ignore', stderr: 'ignore' })
+    return
+  }
+
+  if (existsSync('/usr/bin/osascript')) {
+    spawnSync('/usr/bin/osascript', [
+      '-e',
+      `display notification ${appleScriptString(message)} with title ${appleScriptString(title)} subtitle ${appleScriptString(subtitle)}`,
+    ], { stdout: 'ignore', stderr: 'ignore' })
+  }
+}
+
 function getSelectedLeaderPanesByWindow(): Map<string, string> {
   const selected = new Map<string, string>()
   const out = tmuxOutput(['list-clients', '-F', '#{client_session}\t#{window_name}\t#{pane_id}'])
@@ -726,6 +777,7 @@ function updateLeaderUnreadState(
   filePath: string | undefined,
   selectedNow: Map<string, string>,
   selectedBefore: Map<string, string>,
+  roomId: string,
 ): boolean {
   if (!filePath) {
     leaderUnreadByPane.delete(pane.paneId)
@@ -753,6 +805,7 @@ function updateLeaderUnreadState(
     state.completedKey = completedKey
     state.unread = true
     becameUnread = true
+    notifyLeaderCompletion(pane, roomId)
   }
 
   const clickedPaneAfterUnread = pane.ackClickToken !== '' && pane.ackClickToken !== state.ackClickToken
@@ -949,7 +1002,7 @@ function updateTmuxPaneTitlesOnce(): void {
       ? processInfo.roomId
       : (filePath ? latestWorkLabelFromFile(filePath) : undefined)
     if (workLabel) workLabelByRoom.set(processInfo.roomId, workLabel)
-    const unread = updateLeaderUnreadState(pane, filePath, selectedNow, selectedBefore)
+    const unread = updateLeaderUnreadState(pane, filePath, selectedNow, selectedBefore, processInfo.roomId)
     unreadByPane.set(pane.paneId, unread)
     if (unread && (pane.windowName === 'A' || pane.windowName === 'B')) {
       const windowUnread = unreadByWindow.get(pane.windowName) ?? new Set<number>()

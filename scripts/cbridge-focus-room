@@ -1,0 +1,72 @@
+#!/bin/zsh
+set -euo pipefail
+
+room="${1:-}"
+TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+
+if [[ -z "$room" || "$room" != LEADER-* ]]; then
+  exit 0
+fi
+
+if [[ ! -x "$TMUX_BIN" ]]; then
+  TMUX_BIN="$(command -v tmux || true)"
+fi
+
+if [[ -z "$TMUX_BIN" ]]; then
+  exit 0
+fi
+
+target_info="$("$TMUX_BIN" list-panes -a -F '#{session_name}|#{window_name}|#{pane_id}|#{@cbridge_room}' 2>/dev/null |
+  awk -F'|' -v room="$room" '$1 == "cbridge-leaders-main" && $4 == room { print $2 "|" $3; exit }')"
+
+if [[ -z "$target_info" ]]; then
+  target_info="$("$TMUX_BIN" list-panes -a -F '#{session_name}|#{window_name}|#{pane_id}|#{@cbridge_room}' 2>/dev/null |
+    awk -F'|' -v room="$room" '$1 ~ /^cbridge-leaders-/ && $4 == room { print $2 "|" $3; exit }')"
+fi
+
+window_name="${target_info%%|*}"
+pane_id="${target_info#*|}"
+
+if [[ -z "$window_name" || -z "$pane_id" || "$window_name" == "$pane_id" ]]; then
+  exit 0
+fi
+
+tab_session="cbridge-leaders-tab-${window_name}"
+if "$TMUX_BIN" has-session -t "$tab_session" 2>/dev/null; then
+  "$TMUX_BIN" select-window -t "${tab_session}:${window_name}" 2>/dev/null || true
+fi
+
+"$TMUX_BIN" select-window -t "cbridge-leaders-main:${window_name}" 2>/dev/null || true
+"$TMUX_BIN" select-pane -t "$pane_id" 2>/dev/null || true
+"$TMUX_BIN" set-option -pt "$pane_id" @cbridge_ack_click "$(date +%s%N)" 2>/dev/null || true
+"$TMUX_BIN" display-message -t "$pane_id" "${room} 답변으로 이동" 2>/dev/null || true
+
+if [[ -d /Applications/Ghostty.app ]]; then
+  /usr/bin/osascript - "$window_name" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  set targetTitle to "cbridge " & item 1 of argv
+  tell application "Ghostty"
+    activate
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (name of t as text) starts with targetTitle then
+          select tab t
+          activate window w
+          try
+            focus (focused terminal of t)
+          end try
+          return
+        end if
+      end repeat
+    end repeat
+    if (count of windows) > 0 then activate window front window
+  end tell
+end run
+APPLESCRIPT
+elif [[ -d /Applications/Warp.app ]]; then
+  /usr/bin/open -a Warp >/dev/null 2>&1 || true
+elif [[ -d /Applications/iTerm.app ]]; then
+  /usr/bin/open -a iTerm >/dev/null 2>&1 || true
+else
+  /usr/bin/open -a Terminal >/dev/null 2>&1 || true
+fi
