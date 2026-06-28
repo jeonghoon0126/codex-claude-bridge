@@ -1,0 +1,13 @@
+#!/bin/zsh
+set -euo pipefail
+
+name="${0:t}"
+window="${name#cbridge-ghostty-attach-}"
+
+if [[ -z "$window" || "$window" == "$name" ]]; then
+  echo "missing cbridge Ghostty window suffix in executable name: $name" >&2
+  exit 2
+fi
+
+printf '\033]0;cbridge %s\007' "$window"
+exec /opt/homebrew/bin/tmux attach -t "cbridge-leaders-tab-$window"

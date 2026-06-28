@@ -377,12 +377,12 @@ Bun.serve({
       })()
     }
 
-    // ── API: Codex polls for Claude's reply (long-poll, up to 60m) ──
+    // ── API: Codex polls for Claude's reply (long-poll, up to 120s) ──
     // GET /api/poll-reply/:id
     if (url.pathname.startsWith('/api/poll-reply/') && req.method === 'GET') {
       pruneExpiredPendingReplies()
       const msgId = url.pathname.slice('/api/poll-reply/'.length)
-      const timeout = Number(url.searchParams.get('timeout') ?? 3600000)
+      const timeout = Number(url.searchParams.get('timeout') ?? 120000)
       const pending = pendingReplies.get(msgId)
 
       if (!pending) {
@@ -406,7 +406,7 @@ Bun.serve({
           timer: setTimeout(() => {
             removeWaiter(msgId, waiter)
             resolve(Response.json({ timeout: true, reply: null }))
-          }, Math.min(timeout, 3600000)),
+          }, Math.min(timeout, 300000)),
           cleanup: () => {
             clearTimeout(waiter.timer)
             req.signal.removeEventListener('abort', onAbort)

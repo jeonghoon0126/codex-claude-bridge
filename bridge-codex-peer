@@ -1,13 +1,11 @@
 #!/bin/sh
 # bridge-codex-peer <ROOM_ID>
-# 두 번째 Codex app-server를 Codex Bridge 응답자 쪽에 연결한다.
+# Codex-backed peer app-server를 띄우고, 해당 peer thread에 붙는 remote Codex를 연다.
 #
 # Usage:
 #   bridge-codex-peer ENG-1234
 
 ROOM="${1}"
-WORKDIR="${CODEX_PEER_CWD:-${CODEX_BRIDGE_CWD:-$PWD}}"
-BUN_BIN="${BUN_BIN:-/Users/wjh/.bun/bin/bun}"
 
 if [ -z "$ROOM" ]; then
   echo "usage: bridge-codex-peer <ROOM_ID>" >&2
@@ -15,8 +13,79 @@ if [ -z "$ROOM" ]; then
   exit 1
 fi
 
+BRIDGE_URL="${CODEX_BRIDGE_URL:-http://localhost:8788}"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-printf "%s" "$ROOM" > "/tmp/claude-bridge-room-$$"
-export CODEX_BRIDGE_ROOM="$ROOM"
-cd "$WORKDIR" || exit 1
-exec "$BUN_BIN" "$SCRIPT_DIR/codex-peer-agent.ts"
+. "$SCRIPT_DIR/bridge-common.sh"
+
+if ! bridge_resolve_workdir; then
+  exit 1
+fi
+
+if ! bridge_ensure_server; then
+  echo "bridge-codex-peer: failed to reach bridge-server at $BRIDGE_URL" >&2
+  exit 1
+fi
+
+if ! RESP=$(curl -s -f -X POST "$BRIDGE_URL/api/rooms/$ROOM" \
+  -H 'content-type: application/json' \
+  -d '{"assistantType":"codex"}'); then
+  echo "bridge-codex-peer: failed to reach bridge-server at $BRIDGE_URL" >&2
+  exit 1
+fi
+
+TOKEN=$(echo "$RESP" | grep -o '"sessionToken":"[^"]*"' | cut -d'"' -f4)
+if [ -z "$TOKEN" ]; then
+  echo "bridge-codex-peer: failed to parse token from response:" >&2
+  echo "  $RESP" >&2
+  exit 1
+fi
+
+PID_FILE="/tmp/codex-peer-bridge-room-$$"
+LAUNCH_FILE="/tmp/codex-peer-launch-$$"
+printf "%s:%s" "$ROOM" "$TOKEN" > "$PID_FILE"
+
+CODEX_BRIDGE_ROOM="$ROOM" \
+CODEX_BRIDGE_TOKEN="$TOKEN" \
+CODEX_BRIDGE_URL="$BRIDGE_URL" \
+CODEX_BRIDGE_WORKDIR="$CODEX_BRIDGE_WORKDIR" \
+CODEX_BRIDGE_PARENT_PID="$$" \
+CODEX_BRIDGE_PID_FILE="$PID_FILE" \
+CODEX_BRIDGE_LAUNCH_FILE="$LAUNCH_FILE" \
+nohup bun "$SCRIPT_DIR/codex-peer.ts" >/tmp/codex-peer-app-"$ROOM".log 2>&1 &
+
+WAIT_COUNT=0
+while [ "$WAIT_COUNT" -lt 75 ]; do
+  if [ -f "$LAUNCH_FILE" ]; then
+    # shellcheck source=/dev/null
+    . "$LAUNCH_FILE"
+    if [ -n "${WS_URL:-}" ]; then
+      break
+    fi
+  fi
+  WAIT_COUNT=$((WAIT_COUNT + 1))
+  sleep 0.2
+done
+
+if [ -z "${WS_URL:-}" ]; then
+  echo "bridge-codex-peer: failed to initialize peer Codex app-server for room $ROOM" >&2
+  echo "  log: /tmp/codex-peer-app-$ROOM.log" >&2
+  exit 1
+fi
+
+printf '[bridge-codex-peer] room %s remote Codex attaching to %s\n' "$ROOM" "$WS_URL"
+exec codex \
+  --remote "$WS_URL" \
+  -C "$CODEX_BRIDGE_WORKDIR" \
+  -c 'features.codex_hooks=false' \
+  -c 'mcp_servers.context7.enabled=false' \
+  -c 'mcp_servers.linear.enabled=false' \
+  -c 'mcp_servers.github.enabled=false' \
+  -c 'mcp_servers.openaiDeveloper.enabled=false' \
+  -c 'mcp_servers.insomnia.enabled=false' \
+  -c 'mcp_servers.codex-bridge.enabled=false' \
+  -c 'mcp_servers.omx_state.enabled=false' \
+  -c 'mcp_servers.omx_memory.enabled=false' \
+  -c 'mcp_servers.omx_code_intel.enabled=false' \
+  -c 'mcp_servers.omx_trace.enabled=false' \
+  -m "${CODEX_BRIDGE_PEER_MODEL:-gpt-5.4}" \
+  "Bridge peer online for room $ROOM. 첫 응답으로 정확히 \"$ROOM 준비됐습니다. 다음 요청을 기다리겠습니다.\"만 출력하고, 이후 이 thread에서 다음 요청을 기다리세요. 이후 non-trivial 요청은 leader Codex가 설계한 [Codex handoff]라고 가정하고 Role, Goal, Success criteria, Source context/evidence, Constraints, Task slice, Allowed tools/edits, Tool notes, Verification, Output, Stop rules 안에서만 수행하세요. 새 설계, scope 확대, dependency 추가, destructive command가 필요하면 실행하지 말고 BLOCKED로 보고하세요."

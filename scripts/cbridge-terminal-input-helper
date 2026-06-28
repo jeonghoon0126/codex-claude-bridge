@@ -1,0 +1,50 @@
+#!/bin/zsh
+set -euo pipefail
+
+HOME_DIR="${HOME:-/Users/wjh}"
+BRIDGE_DIR="${CBRIDGE_DIR:-$HOME_DIR/codex-claude-bridge}"
+SRC="$BRIDGE_DIR/scripts/cbridge-terminal-input-helper.swift"
+CACHE_DIR="${CBRIDGE_TERMINAL_HELPER_CACHE_DIR:-$HOME_DIR/Library/Caches/cbridge}"
+BIN="$CACHE_DIR/cbridge-terminal-input-helper"
+LOG_DIR="$HOME_DIR/.codex-claude-bridge/logs"
+LOG_FILE="$LOG_DIR/terminal-input-helper.log"
+TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+
+if [[ ! -x "$TMUX_BIN" ]]; then
+  TMUX_BIN="$(command -v tmux || true)"
+fi
+
+if [[ -z "$TMUX_BIN" ]]; then
+  printf 'tmux not found\n' >&2
+  exit 1
+fi
+
+if [[ ! -f "$SRC" ]]; then
+  printf 'missing helper source: %s\n' "$SRC" >&2
+  exit 1
+fi
+
+mkdir -p "$CACHE_DIR" "$LOG_DIR"
+
+compiled=0
+if [[ ! -x "$BIN" || "$SRC" -nt "$BIN" ]]; then
+  /usr/bin/swiftc "$SRC" -o "$BIN"
+  compiled=1
+fi
+
+if pgrep -f "${BIN} --run ${TMUX_BIN}" >/dev/null 2>&1; then
+  if (( compiled == 1 )); then
+    pkill -f "${BIN} --run ${TMUX_BIN}" >/dev/null 2>&1 || true
+  else
+    exit 0
+  fi
+fi
+
+"$TMUX_BIN" run-shell -b "${BIN:q} --run ${TMUX_BIN:q} --bridge-dir ${BRIDGE_DIR:q} >> ${LOG_FILE:q} 2>&1"
+sleep 0.8
+if pgrep -f "${BIN} --run ${TMUX_BIN}" >/dev/null 2>&1; then
+  exit 0
+fi
+
+tail -20 "$LOG_FILE" >&2 2>/dev/null || true
+exit 2

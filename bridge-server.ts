@@ -3,30 +3,50 @@
  * Codex Bridge — Central HTTP server for multi-room support.
  *
  * Manages multiple isolated rooms (identified by ticket number e.g. ENG-1234).
- * Each room has its own Codex ↔ Claude message channel.
+ * Each room has its own Codex ↔ assistant message channel.
  *
- * claude-mcp.ts connects here per room to relay messages to/from Claude.
+ * claude-mcp.ts or codex-peer.ts connects here per room to relay messages to/from
+ * the assistant slot.
  * codex-mcp.ts connects here per room to relay messages to/from Codex.
  * covering-bridge.ts uses GET /api/rooms to show room status.
  */
 
-import { spawnSync } from 'child_process'
-import { writeFileSync, mkdirSync } from 'fs'
-import { readFileSync } from 'fs'
+import { writeFileSync, mkdirSync, readFileSync, renameSync, existsSync, appendFileSync } from 'node:fs'
 import { homedir } from 'os'
 import { join, extname } from 'path'
+import { randomBytes } from 'node:crypto'
 import type { ServerWebSocket } from 'bun'
 
+import {
+  normalizeBridgeMessage,
+  validateBridgeTextPayload,
+} from './bridge-message-payload'
+import {
+  createReplyProgress,
+  formatReplyProgressStatus,
+  markReplyCompleted,
+  markReplyDelivered,
+  markReplyInProgress,
+  serializeReplyProgress,
+  type ReplyProgress,
+  type ReplyProgressSnapshot,
+} from './bridge-reply-progress'
+
 const PORT = Number(process.env.CODEX_BRIDGE_PORT ?? 8788)
+const STATE_FILE = process.env.CODEX_BRIDGE_STATE_FILE ?? '/tmp/codex-bridge-state.json'
+const PERSIST_VERSION = 1
+const STALE_CUTOFF_MS = 60 * 60 * 1000  // 1 hour
+const PERSIST_DEBOUNCE_MS = 500
 const STATE_DIR = join(homedir(), '.claude', 'channels', 'codex-bridge')
 const FILES_DIR = join(STATE_DIR, 'files')
-const GHOSTTY_LAYOUT_GAP = Math.max(0, Number(process.env.CODEX_BRIDGE_GHOSTTY_LAYOUT_GAP ?? 8))
 
 // ── Types ──
 
+type AssistantType = 'claude' | 'codex'
+
 type Msg = {
   id: string
-  from: 'claude' | 'codex' | 'user'
+  from: 'assistant' | 'codex' | 'user'
   text: string
   ts: number
   replyTo?: string
@@ -47,7 +67,9 @@ type ReplyWaiter = {
 type PendingReply = {
   createdAt: number
   normalizedMessage?: string
+  progress: ReplyProgress
   reply?: string
+  replyDeliveredAt?: number
   waiters: Set<ReplyWaiter>
 }
 
@@ -57,50 +79,20 @@ type ClaudeWaiter = {
   cleanup: () => void
 }
 
-type GhosttyGrid = {
-  rows: number
-  cols: number
-}
-
-type GhosttyWindow = {
-  index: number
-  name: string
-  x: number
-  y: number
-  width: number
-  height: number
-}
-
-type ScreenFrame = {
-  x: number
-  y: number
-  width: number
-  height: number
-}
-
-let ghosttyGrid: GhosttyGrid = { rows: 2, cols: 2 }
-
 // If no heartbeat/poll within this window, consider the agent disconnected.
 const HEARTBEAT_TIMEOUT_MS = 3000  // 3× the 1s heartbeat interval
-
-type RoleTemplate = {
-  name: string
-  claudeRole: string
-  codexRole: string
-}
 
 type RoomState = {
   id: string
   createdAt: number
+  assistantType: AssistantType
   // Session token — generated on room creation, written into PID files by covering-bridge.
   // MCP processes must echo it in every heartbeat. Stale processes (wrong/no token) get 404.
-  // Liveness: updated by claude-mcp's pending-for-claude poll and codex-mcp's heartbeat.
-  // claudeConnected/codexConnected are computed dynamically — not stored as booleans.
+  // Liveness: updated by the assistant lane's pending-for-claude poll and codex-mcp's heartbeat.
+  // assistantConnected/codexConnected are computed dynamically — not stored as booleans.
   claudeLastSeen: number
   codexLastSeen: number
   lastActivity: number
-  // Collaboration role template (optional)
-  roleTemplate?: RoleTemplate
   // Codex → Claude reply tracking
   pendingReplies: Map<string, PendingReply>
   inFlightCodexMessages: Map<string, string>
@@ -109,21 +101,93 @@ type RoomState = {
   // Codex → Claude delivery queue (polled by claude-mcp.ts)
   pendingForClaude: { id: string; text: string; sender: string; replyTo?: string }[]
   pendingForClaudeWaiters: Set<ClaudeWaiter>
+  readonly sessionToken: string
   // WebSocket clients for this room's web UI
   clients: Set<ServerWebSocket<unknown>>
+}
+
+type SerializedPendingReply = {
+  msgId: string
+  createdAt: number
+  normalizedMessage?: string
+  progress?: ReplyProgress
+  reply?: string
+  replyDeliveredAt?: number
+}
+
+type SerializedRoom = {
+  id: string
+  createdAt: number
+  assistantType?: AssistantType
+  sessionToken: string
+  lastActivity: number
+  pendingForCodex: { id: string; text: string }[]
+  pendingReplies: SerializedPendingReply[]
+}
+
+type PersistedState = {
+  version: number
+  savedAt: number
+  rooms: SerializedRoom[]
 }
 
 function isClaudeConnected(room: RoomState) {
   return room.claudeLastSeen > 0 && (Date.now() - room.claudeLastSeen) < HEARTBEAT_TIMEOUT_MS
 }
 
+function isAssistantConnected(room: RoomState) {
+  return isClaudeConnected(room)
+}
+
 function isCodexConnected(room: RoomState) {
   return room.codexLastSeen > 0 && (Date.now() - room.codexLastSeen) < HEARTBEAT_TIMEOUT_MS
+}
+
+function assistantLaneLabel(room: Pick<RoomState, 'assistantType'>) {
+  return room.assistantType === 'codex' ? 'codex-peer' : 'claude'
+}
+
+function assistantReplyName(room: Pick<RoomState, 'assistantType'>) {
+  return room.assistantType === 'codex' ? 'Codex peer' : 'Claude'
+}
+
+function parseAssistantType(value: unknown): AssistantType | null {
+  if (value === undefined) return 'claude'
+  if (value === 'claude' || value === 'codex') return value
+  return null
+}
+
+type AssistantTypeRequest = {
+  assistantType: AssistantType
+  explicit: boolean
+}
+
+async function readAssistantTypeFromRequest(req: Request): Promise<AssistantTypeRequest | null> {
+  const raw = await req.text()
+  if (!raw.trim()) {
+    return {
+      assistantType: 'claude',
+      explicit: false,
+    }
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as { assistantType?: unknown }
+    const assistantType = parseAssistantType(parsed.assistantType)
+    if (!assistantType) return null
+    return {
+      assistantType,
+      explicit: parsed.assistantType !== undefined,
+    }
+  } catch {
+    return null
+  }
 }
 
 // ── Room registry ──
 
 const rooms = new Map<string, RoomState>()
+loadState()
 
 // Tombstone: roomIds deleted within the last 10s. Prevents zombie MCP processes from
 // instantly reviving a room after [c] closes it. Expires automatically after 10s,
@@ -138,11 +202,12 @@ function isTombstoned(roomId: string) {
   return ts !== undefined && Date.now() - ts < 10000
 }
 
-function getOrCreateRoom(roomId: string): RoomState {
+function getOrCreateRoom(roomId: string, assistantType: AssistantType = 'claude'): RoomState {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, {
       id: roomId,
       createdAt: Date.now(),
+      assistantType,
       claudeLastSeen: 0,
       codexLastSeen: 0,
       lastActivity: Date.now(),
@@ -151,9 +216,11 @@ function getOrCreateRoom(roomId: string): RoomState {
       pendingForCodex: [],
       pendingForClaude: [],
       pendingForClaudeWaiters: new Set(),
+      sessionToken: randomBytes(16).toString('hex'),
       clients: new Set(),
     })
     process.stderr.write(`[bridge] room created: ${roomId}\n`)
+    schedulePersist()
   }
   return rooms.get(roomId)!
 }
@@ -162,15 +229,158 @@ function touchRoom(room: RoomState) {
   room.lastActivity = Date.now()
 }
 
+// ── Persistence ──
+
+function serializeRoom(room: RoomState): SerializedRoom {
+  const serializedReplies: SerializedPendingReply[] = []
+  for (const [msgId, pending] of room.pendingReplies) {
+    serializedReplies.push({
+      msgId,
+      createdAt: pending.createdAt,
+      normalizedMessage: pending.normalizedMessage,
+      progress: pending.progress,
+      reply: pending.reply,
+      replyDeliveredAt: pending.replyDeliveredAt,
+    })
+  }
+  return {
+    id: room.id,
+    createdAt: room.createdAt,
+    assistantType: room.assistantType,
+    sessionToken: room.sessionToken,
+    lastActivity: room.lastActivity,
+    pendingForCodex: [...room.pendingForCodex],
+    pendingReplies: serializedReplies,
+  }
+}
+
+let persistTimer: Timer | null = null
+
+function persistState(): void {
+  persistTimer = null
+  try {
+    const state: PersistedState = {
+      version: PERSIST_VERSION,
+      savedAt: Date.now(),
+      rooms: Array.from(rooms.values()).map(serializeRoom),
+    }
+    writeFileSync(STATE_FILE, JSON.stringify(state), 'utf8')
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(`[bridge] persist failed: ${msg}\n`)
+  }
+}
+
+function schedulePersist(): void {
+  if (persistTimer !== null) return
+  persistTimer = setTimeout(persistState, PERSIST_DEBOUNCE_MS)
+}
+
+function loadState(): void {
+  if (!existsSync(STATE_FILE)) return
+  let raw: string
+  try {
+    raw = readFileSync(STATE_FILE, 'utf8')
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(`[bridge] state read failed: ${msg}\n`)
+    return
+  }
+  let parsed: PersistedState
+  try {
+    parsed = JSON.parse(raw) as PersistedState
+  } catch {
+    const corruptPath = `${STATE_FILE}.corrupted-${Date.now()}`
+    try { renameSync(STATE_FILE, corruptPath) } catch {}
+    process.stderr.write(`[bridge] state file corrupt; moved to ${corruptPath}\n`)
+    return
+  }
+  if (parsed.version !== PERSIST_VERSION) {
+    process.stderr.write(`[bridge] state version ${parsed.version} != ${PERSIST_VERSION}, skipping\n`)
+    return
+  }
+  const now = Date.now()
+  let restored = 0
+  let skipped = 0
+  for (const sr of parsed.rooms) {
+    if (now - sr.lastActivity > STALE_CUTOFF_MS) {
+      skipped++
+      continue
+    }
+    const pendingReplies = new Map<string, PendingReply>()
+    for (const sp of sr.pendingReplies) {
+      // Drop entries with no reply — the Codex that was waiting has already timed out.
+      if (sp.reply === undefined) continue
+      const progress = sp.progress ?? createReplyProgress(sp.createdAt)
+      markReplyCompleted(progress, sp.createdAt)
+      pendingReplies.set(sp.msgId, {
+        createdAt: sp.createdAt,
+        normalizedMessage: sp.normalizedMessage,
+        progress,
+        reply: sp.reply,
+        replyDeliveredAt: sp.replyDeliveredAt,
+        waiters: new Set(),
+      })
+    }
+    rooms.set(sr.id, {
+      id: sr.id,
+      createdAt: sr.createdAt,
+      assistantType: sr.assistantType ?? 'claude',
+      claudeLastSeen: 0,
+      codexLastSeen: 0,
+      lastActivity: sr.lastActivity,
+      pendingReplies,
+      inFlightCodexMessages: new Map(),
+      pendingForCodex: [...sr.pendingForCodex],
+      pendingForClaude: [],
+      pendingForClaudeWaiters: new Set(),
+      sessionToken: sr.sessionToken,
+      clients: new Set(),
+    })
+    restored++
+  }
+  process.stderr.write(`[bridge] state loaded: ${restored} room(s) restored, ${skipped} stale\n`)
+}
+
+// ── Message history log ──
+
+const LOG_DIR = process.env.CODEX_BRIDGE_LOG_DIR ?? '/tmp'
+
+function sanitizeRoomIdForPath(roomId: string): string {
+  // Defense-in-depth: block path traversal characters even though roomId is trusted
+  return roomId.replace(/[^\w.-]/g, '_')
+}
+
+function logMessage(
+  roomId: string,
+  kind: string,
+  id: string,
+  sender: string,
+  text: string,
+): void {
+  try {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      roomId,
+      kind,
+      id,
+      sender,
+      text,
+    }) + '\n'
+    const path = `${LOG_DIR}/bridge-${sanitizeRoomIdForPath(roomId)}.jsonl`
+    // appendFileSync is fine for dev-scale traffic
+    appendFileSync(path, line, 'utf8')
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    process.stderr.write(`[bridge] log failed: ${msg}\n`)
+  }
+}
+
 // ── Utilities ──
 
 let seq = 0
 function nextId(prefix = 'm') {
   return `${prefix}${Date.now()}-${++seq}`
-}
-
-function normalizeMessage(message: string) {
-  return message.trim().replace(/\s+/g, ' ')
 }
 
 function mime(ext: string) {
@@ -190,6 +400,7 @@ function broadcast(room: RoomState, m: Wire) {
 // ── Reply routing (Codex waits for Claude) ──
 
 const MAX_PENDING_REPLY_MS = 10 * 60 * 1000
+const REPLIED_PENDING_REPLY_GRACE_MS = 2 * 60 * 1000
 
 function dropPendingReply(room: RoomState, msgId: string) {
   const pending = room.pendingReplies.get(msgId)
@@ -200,11 +411,41 @@ function dropPendingReply(room: RoomState, msgId: string) {
   }
   for (const w of pending.waiters) w.cleanup()
   pending.waiters.clear()
+  schedulePersist()
+}
+
+function listActiveReplyStatuses(room: RoomState) {
+  const statuses: ReplyProgressSnapshot[] = []
+  for (const [msgId, pending] of room.pendingReplies) {
+    if (pending.progress.state === 'replied') continue
+    statuses.push(serializeReplyProgress(msgId, pending.progress))
+  }
+  return statuses
+}
+
+function markDeliveredMessages(room: RoomState, messages: Array<{ id: string; sender: string }>) {
+  let changed = false
+  for (const message of messages) {
+    if (message.sender !== 'codex') continue
+    const pending = room.pendingReplies.get(message.id)
+    if (!pending) continue
+    if (pending.progress.state === 'queued') changed = true
+    markReplyDelivered(pending.progress)
+  }
+  if (changed) schedulePersist()
 }
 
 function pruneExpiredPendingReplies(room: RoomState) {
   const now = Date.now()
   for (const [msgId, pending] of room.pendingReplies) {
+    if (
+      pending.reply !== undefined &&
+      pending.replyDeliveredAt !== undefined &&
+      now - pending.replyDeliveredAt > REPLIED_PENDING_REPLY_GRACE_MS
+    ) {
+      dropPendingReply(room, msgId)
+      continue
+    }
     if (now - pending.createdAt > MAX_PENDING_REPLY_MS) dropPendingReply(room, msgId)
   }
 }
@@ -214,11 +455,17 @@ function resolveCodexReply(room: RoomState, replyToId: string | undefined, text:
   const pending = room.pendingReplies.get(replyToId)
   if (!pending || pending.reply !== undefined) return
   pending.reply = text
+  markReplyCompleted(pending.progress)
   if (pending.waiters.size > 0) {
     const waiters = Array.from(pending.waiters)
-    dropPendingReply(room, replyToId)
+    pending.waiters.clear()
+    pending.replyDeliveredAt = Date.now()
+    schedulePersist()
+    for (const w of waiters) w.cleanup()
     for (const w of waiters) w.resolve(Response.json({ timeout: false, reply: text }))
+    return
   }
+  schedulePersist()
 }
 
 function drainLateRepliesForCodex(room: RoomState) {
@@ -243,188 +490,22 @@ function deliverMessageToClaude(
   room.pendingForClaude.push({ id, text, sender, replyTo })
   if (room.pendingForClaudeWaiters.size > 0) {
     const messages = room.pendingForClaude.splice(0)
+    markDeliveredMessages(room, messages)
     const waiters = Array.from(room.pendingForClaudeWaiters)
     room.pendingForClaudeWaiters.clear()
     for (const w of waiters) w.resolve(Response.json({ messages }))
   }
 }
 
-function clampGridValue(value: unknown, fallback: number): number {
-  const n = Number(value)
-  if (!Number.isFinite(n)) return fallback
-  return Math.min(8, Math.max(1, Math.round(n)))
-}
+// ── Token authorization ──
 
-function listGhosttyWindows(): GhosttyWindow[] {
-  const script = `
-tell application "System Events"
-  try
-    tell process "Ghostty"
-      set out to ""
-      repeat with i from 1 to count of windows
-        set w to window i
-        set winName to name of w
-        set winPos to position of w
-        set winSize to size of w
-        set out to out & (i as text) & "|" & winName & "|" & ((item 1 of winPos) as text) & "|" & ((item 2 of winPos) as text) & "|" & ((item 1 of winSize) as text) & "|" & ((item 2 of winSize) as text) & linefeed
-      end repeat
-      return out
-    end tell
-  on error
-    return ""
-  end try
-end tell`
-
-  const res = spawnSync('osascript', [], { encoding: 'utf8', input: script })
-  if (res.status !== 0) return []
-  return (res.stdout ?? '')
-    .trim()
-    .split('\n')
-    .map(line => {
-      const [indexRaw, name = '', xRaw, yRaw, widthRaw, heightRaw] = line.split('|')
-      const index = Number(indexRaw)
-      const x = Number(xRaw)
-      const y = Number(yRaw)
-      const width = Number(widthRaw)
-      const height = Number(heightRaw)
-      if (![index, x, y, width, height].every(Number.isFinite)) return null
-      return { index, name, x, y, width, height }
-    })
-    .filter((w): w is GhosttyWindow => Boolean(w))
-}
-
-function looksLikeCbridgeLeaderWindow(name: string): boolean {
-  return /\b(LEADER[- ][A-Z0-9_-]+|BRIDGE-CODEX)\b/i.test(name)
-}
-
-function targetGhosttyWindows(windows: GhosttyWindow[]): { windows: GhosttyWindow[]; fallbackToAll: boolean } {
-  const leaderWindows = windows.filter(w => looksLikeCbridgeLeaderWindow(w.name))
-  const selected = leaderWindows.length > 0 ? leaderWindows : windows
-  return {
-    windows: selected.sort((a, b) => (a.y - b.y) || (a.x - b.x) || (a.index - b.index)),
-    fallbackToAll: leaderWindows.length === 0,
+function checkToken(req: Request, room: RoomState): Response | null {
+  const provided = req.headers.get('x-bridge-token')
+  if (!provided || provided !== room.sessionToken) {
+    process.stderr.write(`[bridge] auth rejected: roomId=${room.id}\n`)
+    return Response.json({ error: 'bad token' }, { status: 401 })
   }
-}
-
-function getScreenFrames(): ScreenFrame[] {
-  const quartzScript = `
-import json
-try:
-    import Quartz
-    main = Quartz.NSScreen.mainScreen()
-    main_height = float(main.frame().size.height)
-    frames = []
-    for screen in Quartz.NSScreen.screens():
-        frame = screen.visibleFrame()
-        frames.append({
-            "x": round(float(frame.origin.x)),
-            "y": round(main_height - (float(frame.origin.y) + float(frame.size.height))),
-            "width": round(float(frame.size.width)),
-            "height": round(float(frame.size.height)),
-        })
-    print(json.dumps(frames))
-except Exception:
-    print("[]")
-`
-  const py = spawnSync('python3', ['-c', quartzScript], { encoding: 'utf8' })
-  try {
-    const frames = JSON.parse(py.stdout || '[]') as ScreenFrame[]
-    if (Array.isArray(frames) && frames.length > 0) {
-      const usable = frames.filter(frame => frame.width > 0 && frame.height > 0)
-      if (usable.length > 0) return usable
-    }
-  } catch {}
-
-  const finder = spawnSync('osascript', ['-e', 'tell application "Finder" to get bounds of window of desktop'], { encoding: 'utf8' })
-  const parts = (finder.stdout ?? '').trim().split(',').map(part => Number(part.trim()))
-  if (parts.length === 4 && parts.every(Number.isFinite)) {
-    const [left, top, right, bottom] = parts
-    return [{ x: left, y: top, width: right - left, height: bottom - top }]
-  }
-  return [{ x: 0, y: 0, width: 1440, height: 900 }]
-}
-
-function overlapArea(a: ScreenFrame, b: ScreenFrame): number {
-  const left = Math.max(a.x, b.x)
-  const top = Math.max(a.y, b.y)
-  const right = Math.min(a.x + a.width, b.x + b.width)
-  const bottom = Math.min(a.y + a.height, b.y + b.height)
-  return Math.max(0, right - left) * Math.max(0, bottom - top)
-}
-
-function selectLayoutFrame(windows: GhosttyWindow[]): ScreenFrame {
-  const screens = getScreenFrames()
-  if (screens.length === 1 || windows.length === 0) return screens[0]
-
-  const group = windows.reduce<ScreenFrame>((acc, win) => {
-    const right = Math.max(acc.x + acc.width, win.x + win.width)
-    const bottom = Math.max(acc.y + acc.height, win.y + win.height)
-    const left = Math.min(acc.x, win.x)
-    const top = Math.min(acc.y, win.y)
-    return { x: left, y: top, width: right - left, height: bottom - top }
-  }, { x: windows[0].x, y: windows[0].y, width: windows[0].width, height: windows[0].height })
-
-  return screens
-    .map(frame => ({ frame, area: overlapArea(frame, group) }))
-    .sort((a, b) => b.area - a.area)[0]?.frame ?? screens[0]
-}
-
-function moveGhosttyWindows(placements: Array<GhosttyWindow & ScreenFrame>): void {
-  if (placements.length === 0) return
-  const commands = placements.flatMap(win => [
-    `set position of window ${win.index} to {${Math.round(win.x)}, ${Math.round(win.y)}}`,
-    `set size of window ${win.index} to {${Math.round(win.width)}, ${Math.round(win.height)}}`,
-  ])
-  const script = `
-tell application "System Events"
-  try
-    tell process "Ghostty"
-      ${commands.join('\n      ')}
-    end tell
-  on error errText
-    error errText
-  end try
-end tell`
-  const res = spawnSync('osascript', [], { encoding: 'utf8', input: script })
-  if (res.status !== 0) {
-    throw new Error((res.stderr || res.stdout || 'Ghostty window move failed').trim())
-  }
-}
-
-function applyGhosttyLayout(rows: number, cols: number, dryRun = false) {
-  const all = listGhosttyWindows()
-  const target = targetGhosttyWindows(all)
-  const frame = selectLayoutFrame(target.windows)
-  const capacity = rows * cols
-  const arranged = target.windows.slice(0, capacity)
-  const gap = GHOSTTY_LAYOUT_GAP
-  const cellWidth = Math.max(320, Math.floor((frame.width - gap * (cols - 1)) / cols))
-  const cellHeight = Math.max(260, Math.floor((frame.height - gap * (rows - 1)) / rows))
-
-  const placements = arranged.map((win, i) => {
-    const row = Math.floor(i / cols)
-    const col = i % cols
-    return {
-      ...win,
-      x: frame.x + col * (cellWidth + gap),
-      y: frame.y + row * (cellHeight + gap),
-      width: cellWidth,
-      height: cellHeight,
-    }
-  })
-
-  if (!dryRun) moveGhosttyWindows(placements)
-  return {
-    rows,
-    cols,
-    dryRun,
-    matched: target.windows.length,
-    arranged: placements.length,
-    unplaced: Math.max(0, target.windows.length - placements.length),
-    fallbackToAll: target.fallbackToAll,
-    frame,
-    windows: placements.map(win => ({ index: win.index, name: win.name })),
-  }
+  return null
 }
 
 // ── HTTP server ──
@@ -432,11 +513,15 @@ function applyGhosttyLayout(rows: number, cols: number, dryRun = false) {
 Bun.serve({
   port: PORT,
   hostname: '127.0.0.1',
-  fetch(req, server) {
+  async fetch(req, server) {
     const url = new URL(req.url)
     const path = url.pathname
 
     // WebSocket upgrade — /ws/:roomId
+    // NOTE: WebSocket path still uses getOrCreateRoom — token gating for WS
+    // handshakes requires a query-string token (no custom headers available in
+    // browser upgrade requests) and is deferred to a later task. Phantom room
+    // creation via /ws/:roomId is a known gap, not addressed in P0 session-token.
     if (path.startsWith('/ws/') && req.headers.get('upgrade') === 'websocket') {
       const roomId = decodeURIComponent(path.slice(4))
       if (!roomId) return new Response('missing room', { status: 400 })
@@ -461,93 +546,38 @@ Bun.serve({
       const list = Array.from(rooms.values()).map(r => ({
         id: r.id,
         createdAt: r.createdAt,
-        claudeConnected: isClaudeConnected(r),
+        assistantType: r.assistantType,
+        assistantConnected: isAssistantConnected(r),
+        claudeConnected: r.assistantType === 'claude' && isAssistantConnected(r),
         codexConnected: isCodexConnected(r),
         lastActivity: r.lastActivity,
       }))
       return Response.json(list)
     }
 
-    // ── GET/POST /api/ghostty-layout — arrange cbridge leader Ghostty windows ──
-    if (path === '/api/ghostty-layout' && req.method === 'GET') {
-      const all = listGhosttyWindows()
-      const target = targetGhosttyWindows(all)
-      return Response.json({
-        rows: ghosttyGrid.rows,
-        cols: ghosttyGrid.cols,
-        total: all.length,
-        matched: target.windows.length,
-        fallbackToAll: target.fallbackToAll,
-        windows: target.windows.map(win => ({ index: win.index, name: win.name })),
-      })
-    }
-
-    if (path === '/api/ghostty-layout' && req.method === 'POST') {
-      return (async () => {
-        try {
-          const body = await req.json().catch(() => ({})) as {
-            action?: string
-            layout?: string
-            rows?: number
-            cols?: number
-            dryRun?: boolean
-          }
-          let rows = ghosttyGrid.rows
-          let cols = ghosttyGrid.cols
-
-          if (body.layout === '2x2') {
-            rows = 2
-            cols = 2
-          } else if (body.layout === '4x1') {
-            rows = 1
-            cols = 4
-          } else if (body.action === 'add-row') {
-            rows += 1
-          } else if (body.action === 'remove-row') {
-            rows -= 1
-          } else if (body.action === 'add-col') {
-            cols += 1
-          } else if (body.action === 'remove-col') {
-            cols -= 1
-          }
-
-          rows = clampGridValue(body.rows ?? rows, ghosttyGrid.rows)
-          cols = clampGridValue(body.cols ?? cols, ghosttyGrid.cols)
-          ghosttyGrid = { rows, cols }
-          return Response.json({ ok: true, ...applyGhosttyLayout(rows, cols, body.dryRun === true) })
-        } catch (err) {
-          return Response.json({
-            ok: false,
-            error: err instanceof Error ? err.message : String(err),
-          }, { status: 500 })
-        }
-      })()
-    }
-
     // ── POST /api/rooms/:roomId — pre-create room (called by covering-bridge) ──
-    // ── GET  /api/rooms/:roomId/config — role template config ──
     // ── DELETE /api/rooms/:roomId — close room ──
     const closeMatch = path.match(/^\/api\/rooms\/([^/]+)$/)
-    const configMatch = path.match(/^\/api\/rooms\/([^/]+)\/config$/)
-    if (configMatch && req.method === 'GET') {
-      const roomId = decodeURIComponent(configMatch[1])
-      const room = rooms.get(roomId)
-      if (!room) return Response.json({ error: 'room not found' }, { status: 404 })
-      return Response.json({ roomId, roleTemplate: room.roleTemplate ?? null })
-    }
     if (closeMatch && req.method === 'POST') {
       const roomId = decodeURIComponent(closeMatch[1])
-      const room = getOrCreateRoom(roomId)
-      return (async () => {
-        try {
-          const body = await req.json() as { roleTemplate?: { name: string; claudeRole: string; codexRole: string } }
-          if (body?.roleTemplate?.name) {
-            room.roleTemplate = body.roleTemplate
-            process.stderr.write(`[bridge] role set for room ${roomId}: ${body.roleTemplate.name}\n`)
-          }
-        } catch {}
-        return new Response(null, { status: 201 })
-      })()
+      const assistantRequest = await readAssistantTypeFromRequest(req)
+      if (!assistantRequest) {
+        return Response.json({ error: 'assistantType must be "claude" or "codex"' }, { status: 400 })
+      }
+      const had = rooms.has(roomId)
+      const room = getOrCreateRoom(roomId, assistantRequest.assistantType)
+      if (had && assistantRequest.explicit && room.assistantType !== assistantRequest.assistantType) {
+        room.assistantType = assistantRequest.assistantType
+        touchRoom(room)
+        schedulePersist()
+      }
+      return Response.json(
+        {
+          sessionToken: room.sessionToken,
+          assistantType: room.assistantType,
+        },
+        { status: had ? 200 : 201 },
+      )
     }
     if (closeMatch && req.method === 'DELETE') {
       const roomId = decodeURIComponent(closeMatch[1])
@@ -559,6 +589,7 @@ Bun.serve({
       }
       rooms.delete(roomId)
       markDeleted(roomId)  // tombstone: block auto-create for 10s
+      schedulePersist()
       process.stderr.write(`[bridge] room closed: ${roomId}\n`)
       return new Response(null, { status: 204 })
     }
@@ -580,50 +611,72 @@ Bun.serve({
     const roomId = decodeURIComponent(roomMatch[1])
     const sub = roomMatch[2]
 
-    // Claude connect — auto-creates room on first heartbeat (unless tombstoned)
+    // Assistant connect — room must exist (legitimate clients POST /api/rooms/:id first)
+    // Endpoint name stays Claude-specific for backward compatibility with claude-mcp.ts.
+    // Order: isTombstoned → rooms.get+404 → checkToken → business logic
     if (sub === 'claude/connect') {
       if (req.method === 'POST') {
         if (isTombstoned(roomId)) return new Response(null, { status: 404 })
-        const room = getOrCreateRoom(roomId)
+        const room = rooms.get(roomId)
+        if (!room) return new Response('room not found', { status: 404 })
+        const authFail = checkToken(req, room)
+        if (authFail) return authFail
         room.claudeLastSeen = Date.now()
         touchRoom(room)
-        process.stderr.write(`[bridge] claude connected: ${roomId}\n`)
+        process.stderr.write(`[bridge] ${assistantLaneLabel(room)} connected: ${roomId}\n`)
         return new Response(null, { status: 204 })
       }
       if (req.method === 'DELETE') {
         const room = rooms.get(roomId)
-        if (room) { room.claudeLastSeen = 0; touchRoom(room) }
-        process.stderr.write(`[bridge] claude disconnected: ${roomId}\n`)
+        if (!room) return new Response('room not found', { status: 404 })
+        const authFail = checkToken(req, room)
+        if (authFail) return authFail
+        room.claudeLastSeen = 0
+        touchRoom(room)
+        process.stderr.write(`[bridge] ${assistantLaneLabel(room)} disconnected: ${roomId}\n`)
         return new Response(null, { status: 204 })
       }
     }
 
-    // Codex heartbeat — auto-creates room on first heartbeat (unless tombstoned)
+    // Codex heartbeat/connect — room must exist (legitimate clients POST /api/rooms/:id first)
+    // Order: isTombstoned → rooms.get+404 → checkToken → business logic
     if (sub === 'codex/heartbeat' || sub === 'codex/connect') {
       if (req.method === 'POST') {
         if (isTombstoned(roomId)) return new Response(null, { status: 404 })
-        const room = getOrCreateRoom(roomId)
+        const room = rooms.get(roomId)
+        if (!room) return new Response('room not found', { status: 404 })
+        const authFail = checkToken(req, room)
+        if (authFail) return authFail
         room.codexLastSeen = Date.now()
         touchRoom(room)
         return new Response(null, { status: 204 })
       }
       if (req.method === 'DELETE') {
         const room = rooms.get(roomId)
-        if (room) { room.codexLastSeen = 0; touchRoom(room) }
+        if (!room) return new Response('room not found', { status: 404 })
+        const authFail = checkToken(req, room)
+        if (authFail) return authFail
+        room.codexLastSeen = 0
+        touchRoom(room)
         return new Response(null, { status: 204 })
       }
     }
 
-    // GET /api/rooms/:roomId/pending-for-claude — claude-mcp.ts long-polls
+    // GET /api/rooms/:roomId/pending-for-claude — assistant lane long-polls
+    // Endpoint name stays Claude-specific for backward compatibility.
     if (sub === 'pending-for-claude' && req.method === 'GET') {
       const room = rooms.get(roomId)
       if (!room) return Response.json({ error: 'room not found' }, { status: 404 })
-      room.claudeLastSeen = Date.now()  // each poll = heartbeat for Claude liveness
+      const authFail = checkToken(req, room)
+      if (authFail) return authFail
+      room.claudeLastSeen = Date.now()  // each poll = heartbeat for assistant-lane liveness
       touchRoom(room)
       const timeout = Number(url.searchParams.get('timeout') ?? 30000)
 
       if (room.pendingForClaude.length > 0) {
-        return Response.json({ messages: room.pendingForClaude.splice(0) })
+        const messages = room.pendingForClaude.splice(0)
+        markDeliveredMessages(room, messages)
+        return Response.json({ messages })
       }
 
       return new Promise<Response>(resolve => {
@@ -650,37 +703,64 @@ Bun.serve({
       })
     }
 
-    // POST /api/rooms/:roomId/from-claude — claude-mcp.ts sends reply/proactive
+    // POST /api/rooms/:roomId/from-claude — assistant lane sends reply/proactive
+    // Endpoint name stays Claude-specific for backward compatibility.
     if (sub === 'from-claude' && req.method === 'POST') {
       return (async () => {
         const room = rooms.get(roomId)
         if (!room) return Response.json({ error: 'room not found' }, { status: 404 })
+        const authFail = checkToken(req, room)
+        if (authFail) return authFail
         touchRoom(room)
         const body = await req.json() as { text: string; replyTo?: string; proactive?: boolean }
-        const { text, replyTo, proactive } = body
+        const { replyTo, proactive } = body
+        const validation = validateBridgeTextPayload(body.text)
+        if (validation.ok === false) {
+          return Response.json({ error: validation.error }, { status: 400 })
+        }
+
+        const text = validation.text
         const id = nextId('claude-')
-        broadcast(room, { type: 'msg', id, from: 'claude', text, ts: Date.now(), replyTo })
+        broadcast(room, { type: 'msg', id, from: 'assistant', text, ts: Date.now(), replyTo })
         if (proactive) {
           room.pendingForCodex.push({ id, text })
+          schedulePersist()
         } else {
           resolveCodexReply(room, replyTo, text)
         }
+        const assistantLabel = assistantLaneLabel(room)
+        logMessage(
+          roomId,
+          proactive ? `${assistantLabel}→codex:proactive` : `${assistantLabel}→codex:reply`,
+          id,
+          assistantLabel,
+          text,
+        )
         return Response.json({ id })
       })()
     }
 
-    // POST /api/rooms/:roomId/from-codex — Codex sends to Claude
+    // POST /api/rooms/:roomId/from-codex — Codex sends to the assistant lane
+    // rooms.get + 404: prevents phantom room creation on unauthenticated HTTP gate calls
+    // (note: /ws/:roomId upgrade path still auto-creates — see upgrade handler)
     if (sub === 'from-codex' && req.method === 'POST') {
       return (async () => {
-        const room = getOrCreateRoom(roomId)
+        const room = rooms.get(roomId)
+        if (!room) return new Response('room not found', { status: 404 })
+        const authFail = checkToken(req, room)
+        if (authFail) return authFail
         touchRoom(room)
         pruneExpiredPendingReplies(room)
 
         const body = await req.json() as { message: string }
-        const message = body.message?.trim()
-        if (!message) return new Response('missing message', { status: 400 })
+        const validation = validateBridgeTextPayload(body.message)
+        if (validation.ok === false) {
+          return new Response(validation.error, { status: 400 })
+        }
 
-        const normalized = normalizeMessage(message)
+        const message = validation.text
+
+        const normalized = normalizeBridgeMessage(message)
         const existingId = room.inFlightCodexMessages.get(normalized)
         if (existingId && room.pendingReplies.has(existingId)) {
           return Response.json({ id: existingId })
@@ -691,26 +771,100 @@ Bun.serve({
         room.pendingReplies.set(id, {
           createdAt: Date.now(),
           normalizedMessage: normalized,
+          progress: createReplyProgress(),
           waiters: new Set(),
         })
         room.inFlightCodexMessages.set(normalized, id)
+        schedulePersist()
 
         deliverMessageToClaude(room, id, message, 'codex')
         broadcast(room, { type: 'msg', id, from: 'codex', text: message, ts: Date.now() })
+        logMessage(roomId, `codex→${assistantLaneLabel(room)}`, id, 'codex', message)
         return Response.json({ id })
       })()
+    }
+
+    const progressMatch = sub.match(/^reply-progress\/(.+)$/)
+    if (progressMatch && req.method === 'POST') {
+      return (async () => {
+        const room = rooms.get(roomId)
+        if (!room) return Response.json({ error: 'room not found' }, { status: 404 })
+        const authFail = checkToken(req, room)
+        if (authFail) return authFail
+        touchRoom(room)
+
+        const pending = room.pendingReplies.get(progressMatch[1])
+        if (!pending) return Response.json({ error: 'reply not found' }, { status: 404 })
+
+        const body = await req.json() as { note?: string }
+        markReplyInProgress(pending.progress, body.note)
+        schedulePersist()
+
+        return Response.json({
+          ok: true,
+          assistantLabel: assistantLaneLabel(room),
+          assistantName: assistantReplyName(room),
+          status: {
+            ...serializeReplyProgress(progressMatch[1], pending.progress),
+            summary: formatReplyProgressStatus(pending.progress, Date.now(), assistantReplyName(room)),
+          },
+        })
+      })()
+    }
+
+    const statusMatch = sub.match(/^reply-status\/(.+)$/)
+    if (statusMatch && req.method === 'GET') {
+      const room = rooms.get(roomId)
+      if (!room) return Response.json({ found: false }, { status: 404 })
+      const authFail = checkToken(req, room)
+      if (authFail) return authFail
+      touchRoom(room)
+
+      const pending = room.pendingReplies.get(statusMatch[1])
+      if (!pending) return Response.json({ found: false }, { status: 404 })
+
+      return Response.json({
+        found: true,
+        peerAlive: isAssistantConnected(room),
+        assistantLabel: assistantLaneLabel(room),
+        assistantName: assistantReplyName(room),
+        status: {
+          ...serializeReplyProgress(statusMatch[1], pending.progress),
+          summary: formatReplyProgressStatus(pending.progress, Date.now(), assistantReplyName(room)),
+        },
+      })
+    }
+
+    // POST /api/rooms/:roomId/ack-reply/:id — Codex confirms it received a reply
+    const ackMatch = sub.match(/^ack-reply\/(.+)$/)
+    if (ackMatch && req.method === 'POST') {
+      const room = rooms.get(roomId)
+      if (!room) return Response.json({ error: 'room not found' }, { status: 404 })
+      const authFail = checkToken(req, room)
+      if (authFail) return authFail
+      touchRoom(room)
+
+      const pending = room.pendingReplies.get(ackMatch[1])
+      if (!pending || pending.reply === undefined) {
+        return Response.json({ ok: true, acknowledged: false })
+      }
+
+      dropPendingReply(room, ackMatch[1])
+      return Response.json({ ok: true, acknowledged: true })
     }
 
     // GET /api/rooms/:roomId/poll-reply/:id — Codex long-polls for Claude's reply
     const pollMatch = sub.match(/^poll-reply\/(.+)$/)
     if (pollMatch && req.method === 'GET') {
       const room = rooms.get(roomId)
-      if (!room) return Response.json({ timeout: true, reply: null })
+      if (!room) return Response.json({ error: 'room not found' }, { status: 404 })
+      const authFail = checkToken(req, room)
+      if (authFail) return authFail
       pruneExpiredPendingReplies(room)
       touchRoom(room)
 
       const msgId = pollMatch[1]
-      const timeout = Number(url.searchParams.get('timeout') ?? 3600000)
+      const timeout = Number(url.searchParams.get('timeout') ?? 120000)
       const pending = room.pendingReplies.get(msgId)
 
       if (!pending) return Response.json({ timeout: true, reply: null })
@@ -733,7 +887,7 @@ Bun.serve({
             pending.waiters.delete(waiter)
             waiter.cleanup()
             resolve(Response.json({ timeout: true, reply: null }))
-          }, Math.min(timeout, 3600000)),
+          }, Math.min(timeout, 300000)),
           cleanup: () => {
             clearTimeout(waiter.timer)
             req.signal.removeEventListener('abort', onAbort)
@@ -747,11 +901,22 @@ Bun.serve({
     // GET /api/rooms/:roomId/pending-for-codex
     if (sub === 'pending-for-codex' && req.method === 'GET') {
       const room = rooms.get(roomId)
-      if (!room) return Response.json({ messages: [] })
+      if (!room) return Response.json({ error: 'room not found' }, { status: 404 })
+      const authFail = checkToken(req, room)
+      if (authFail) return authFail
       pruneExpiredPendingReplies(room)
       touchRoom(room)
       const messages = [...room.pendingForCodex.splice(0), ...drainLateRepliesForCodex(room)]
-      return Response.json({ messages })
+      const statuses = listActiveReplyStatuses(room).map(status => ({
+        ...status,
+        summary: formatReplyProgressStatus(status, Date.now(), assistantReplyName(room)),
+      }))
+      return Response.json({
+        messages,
+        statuses,
+        assistantLabel: assistantLaneLabel(room),
+        assistantName: assistantReplyName(room),
+      })
     }
 
     // POST /api/rooms/:roomId/upload — file upload from web UI
@@ -833,8 +998,11 @@ const HTML = `<!doctype html>
   #log { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
   .message { max-width: 78%; padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
   .message .label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; opacity: 0.8; }
-  .message.claude { align-self: flex-start; background: #1a1528; border: 1px solid #2d2245; border-bottom-left-radius: 4px; }
-  .message.claude .label { color: #b490ff; }
+  .message.assistant { align-self: flex-start; border-bottom-left-radius: 4px; }
+  .message.assistant.claude { background: #1a1528; border: 1px solid #2d2245; }
+  .message.assistant.claude .label { color: #b490ff; }
+  .message.assistant.codex-peer { background: #161b28; border: 1px solid #24314a; }
+  .message.assistant.codex-peer .label { color: #7ec8ff; }
   .message.codex { align-self: flex-end; background: #0d1f1a; border: 1px solid #1a3d30; border-bottom-right-radius: 4px; }
   .message.codex .label { color: #00d4aa; }
   .message.user { align-self: flex-start; background: #1a1a1a; border: 1px solid #2a2a2a; margin-left: 40px; }
@@ -848,16 +1016,6 @@ const HTML = `<!doctype html>
   #text::placeholder { color: #555; }
   button.send { background: linear-gradient(135deg, #00d4aa, #7b61ff); color: #fff; font-weight: 600; padding: 8px 16px; border-radius: 10px; border: none; cursor: pointer; }
   button.send:disabled { opacity: 0.3; cursor: default; }
-  button.layout { background: #1a1a1a; border: 1px solid #333; color: #cfd3dc; padding: 5px 10px; border-radius: 8px; font-size: 12px; cursor: pointer; }
-  button.layout:hover { border-color: #555; color: #fff; }
-  #layout-menu { position: fixed; z-index: 20; min-width: 184px; padding: 6px; border: 1px solid #333; border-radius: 10px; background: #151515; box-shadow: 0 16px 36px rgba(0,0,0,.34); display: none; }
-  #layout-menu.open { display: block; }
-  #layout-menu button { width: 100%; border: 0; background: transparent; color: #e0e0e0; text-align: left; padding: 8px 10px; border-radius: 7px; font: inherit; font-size: 13px; cursor: pointer; }
-  #layout-menu button:hover { background: #242424; }
-  .menu-label { padding: 7px 10px 4px; color: #777; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
-  .menu-sep { height: 1px; margin: 5px 4px; background: #2a2a2a; }
-  #layout-toast { position: fixed; right: 18px; bottom: 18px; z-index: 21; max-width: min(360px, calc(100vw - 36px)); padding: 10px 12px; border: 1px solid #333; border-radius: 10px; background: #151515; color: #d9dee8; font-size: 13px; box-shadow: 0 16px 36px rgba(0,0,0,.34); opacity: 0; transform: translateY(8px); pointer-events: none; transition: opacity .16s ease, transform .16s ease; }
-  #layout-toast.show { opacity: 1; transform: translateY(0); }
   #log::-webkit-scrollbar { width: 6px; }
   #log::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
 </style>
@@ -866,7 +1024,6 @@ const HTML = `<!doctype html>
 <header>
   <div class="logo">CB</div>
   <h1>Codex Bridge</h1>
-  <button type="button" class="layout" id="layout-btn">Layout</button>
   <select id="room-select"></select>
   <div class="status">
     <div class="dot" id="dot"></div>
@@ -880,17 +1037,6 @@ const HTML = `<!doctype html>
     <button type="submit" class="send" id="send-btn" disabled>Send</button>
   </form>
 </div>
-<div id="layout-menu" role="menu">
-  <div class="menu-label">Ghostty layout</div>
-  <button type="button" data-layout="2x2">2행 2열</button>
-  <button type="button" data-layout="4x1">4열 1행</button>
-  <div class="menu-sep"></div>
-  <button type="button" data-action="add-row">행 추가</button>
-  <button type="button" data-action="remove-row">행 삭제</button>
-  <button type="button" data-action="add-col">열 추가</button>
-  <button type="button" data-action="remove-col">열 삭제</button>
-</div>
-<div id="layout-toast"></div>
 <script>
 const log = document.getElementById('log')
 const form = document.getElementById('form')
@@ -899,72 +1045,38 @@ const sendBtn = document.getElementById('send-btn')
 const dot = document.getElementById('dot')
 const statusText = document.getElementById('status-text')
 const roomSelect = document.getElementById('room-select')
-const layoutBtn = document.getElementById('layout-btn')
-const layoutMenu = document.getElementById('layout-menu')
-const layoutToast = document.getElementById('layout-toast')
 
 let currentRoom = null
 let ws = null
 let uid = 0
-let toastTimer = null
+const roomMeta = new Map()
 
-function clampMenuToViewport(x, y) {
-  const rect = layoutMenu.getBoundingClientRect()
-  return {
-    x: Math.min(x, window.innerWidth - rect.width - 10),
-    y: Math.min(y, window.innerHeight - rect.height - 10),
-  }
+function roomAssistantClass(roomId) {
+  const assistantType = roomMeta.get(roomId)?.assistantType
+  return assistantType === 'codex' ? 'codex-peer' : 'claude'
 }
 
-function openLayoutMenu(x, y) {
-  layoutMenu.classList.add('open')
-  const pos = clampMenuToViewport(x, y)
-  layoutMenu.style.left = Math.max(10, pos.x) + 'px'
-  layoutMenu.style.top = Math.max(10, pos.y) + 'px'
-}
-
-function closeLayoutMenu() {
-  layoutMenu.classList.remove('open')
-}
-
-function showLayoutToast(message) {
-  layoutToast.textContent = message
-  layoutToast.classList.add('show')
-  if (toastTimer) clearTimeout(toastTimer)
-  toastTimer = setTimeout(() => layoutToast.classList.remove('show'), 2200)
-}
-
-async function applyLayout(payload) {
-  closeLayoutMenu()
-  try {
-    const res = await fetch('/api/ghostty-layout', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload),
-    })
-    const data = await res.json()
-    if (!res.ok || !data.ok) throw new Error(data.error || 'layout failed')
-    const suffix = data.fallbackToAll ? ' · leader 제목 없음, Ghostty 전체 적용' : ''
-    showLayoutToast(data.rows + '행 ' + data.cols + '열 적용 · ' + data.arranged + '개 창 이동' + suffix)
-  } catch (err) {
-    showLayoutToast('Layout 실패: ' + (err && err.message ? err.message : String(err)))
-  }
+function roomAssistantLabel(roomId) {
+  const assistantType = roomMeta.get(roomId)?.assistantType
+  return assistantType === 'codex' ? 'Codex peer' : 'Claude'
 }
 
 async function loadRooms() {
   let data = []
   try { data = await fetch('/api/rooms').then(r => r.json()) } catch { return }
   const prev = roomSelect.value
+  roomMeta.clear()
   while (roomSelect.firstChild) roomSelect.removeChild(roomSelect.firstChild)
   const placeholder = document.createElement('option')
   placeholder.value = ''
   placeholder.textContent = data.length === 0 ? 'no rooms yet' : '— select room —'
   roomSelect.appendChild(placeholder)
   for (const r of data) {
+    roomMeta.set(r.id, { assistantType: r.assistantType || 'claude' })
     const o = document.createElement('option')
     o.value = r.id
-    const both = r.claudeConnected && r.codexConnected
-    const one = r.claudeConnected || r.codexConnected
+    const both = r.assistantConnected && r.codexConnected
+    const one = r.assistantConnected || r.codexConnected
     o.textContent = r.id + (both ? ' \u2713' : one ? ' ~' : ' \u25cb')
     roomSelect.appendChild(o)
   }
@@ -1012,33 +1124,6 @@ function connect(roomId) {
 
 roomSelect.addEventListener('change', () => switchRoom(roomSelect.value))
 
-document.addEventListener('contextmenu', e => {
-  e.preventDefault()
-  openLayoutMenu(e.clientX, e.clientY)
-})
-
-document.addEventListener('click', e => {
-  if (!layoutMenu.contains(e.target) && e.target !== layoutBtn) closeLayoutMenu()
-})
-
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeLayoutMenu()
-})
-
-layoutBtn.addEventListener('click', e => {
-  const rect = layoutBtn.getBoundingClientRect()
-  openLayoutMenu(rect.left, rect.bottom + 6)
-})
-
-layoutMenu.addEventListener('click', e => {
-  const target = e.target.closest('button')
-  if (!target) return
-  const layout = target.dataset.layout
-  const action = target.dataset.action
-  if (layout) applyLayout({ layout })
-  if (action) applyLayout({ action })
-})
-
 form.addEventListener('submit', e => {
   e.preventDefault()
   if (!currentRoom || !ws || ws.readyState !== 1) return
@@ -1062,11 +1147,19 @@ text.addEventListener('keydown', e => {
 
 function addMsg(m) {
   const wrap = document.createElement('div')
-  wrap.className = 'message ' + m.from
+  if (m.from === 'assistant') {
+    wrap.className = 'message assistant ' + roomAssistantClass(currentRoom)
+  } else {
+    wrap.className = 'message ' + m.from
+  }
 
   const label = document.createElement('div')
   label.className = 'label'
-  label.textContent = m.from === 'claude' ? 'Claude' : m.from === 'codex' ? 'Codex' : 'You'
+  label.textContent = m.from === 'assistant'
+    ? roomAssistantLabel(currentRoom)
+    : m.from === 'codex'
+      ? 'Codex'
+      : 'You'
   wrap.appendChild(label)
 
   const body = document.createElement('div')

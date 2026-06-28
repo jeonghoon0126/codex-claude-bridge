@@ -6,8 +6,6 @@
 #   bridge-codex ENG-1234
 
 ROOM="${1}"
-WORKDIR="${CODEX_BRIDGE_CWD:-$PWD}"
-CODEX_BIN="${CODEX_BIN:-/Users/wjh/.local/bin/codex}"
 
 if [ -z "$ROOM" ]; then
   echo "usage: bridge-codex <ROOM_ID>" >&2
@@ -15,9 +13,40 @@ if [ -z "$ROOM" ]; then
   exit 1
 fi
 
-printf "%s" "$ROOM" > "/tmp/codex-bridge-room-$$"
-printf "\033]0;LEADER-%s\007" "$ROOM"
-export CODEX_BRIDGE_ROOM="$ROOM"
-cd "$WORKDIR" || exit 1
-/Users/wjh/.bun/bin/bun /Users/wjh/codex-claude-bridge/covering-bridge.ts tmux-pane-titles --start >/dev/null 2>&1 || true
-exec "$CODEX_BIN" --sandbox danger-full-access -a never
+BRIDGE_URL="${CODEX_BRIDGE_URL:-http://localhost:8788}"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+. "$SCRIPT_DIR/bridge-common.sh"
+
+if ! bridge_resolve_workdir; then
+  exit 1
+fi
+
+if ! bridge_ensure_server; then
+  echo "bridge-codex: failed to reach bridge-server at $BRIDGE_URL" >&2
+  exit 1
+fi
+
+# 방 생성 + 토큰 획득
+if ! RESP=$(curl -s -f -X POST "$BRIDGE_URL/api/rooms/$ROOM"); then
+  echo "bridge-codex: failed to reach bridge-server at $BRIDGE_URL" >&2
+  exit 1
+fi
+
+TOKEN=$(echo "$RESP" | grep -o '"sessionToken":"[^"]*"' | cut -d'"' -f4)
+if [ -z "$TOKEN" ]; then
+  echo "bridge-codex: failed to parse token from response:" >&2
+  echo "  $RESP" >&2
+  exit 1
+fi
+
+printf "%s:%s" "$ROOM" "$TOKEN" > "/tmp/codex-bridge-room-$$"
+
+if codex --help 2>/dev/null | grep -q -- '--dangerously-bypass-approvals-and-sandbox'; then
+  set -- --dangerously-bypass-approvals-and-sandbox
+elif codex --help 2>/dev/null | grep -q -- '--full-auto'; then
+  set -- --full-auto
+else
+  set -- -a never -s danger-full-access
+fi
+
+exec codex -C "$CODEX_BRIDGE_WORKDIR" "$@"

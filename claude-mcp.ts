@@ -23,6 +23,8 @@ import {
 import { execFileSync } from 'child_process'
 import { readFileSync } from 'fs'
 
+import { validateBridgeTextPayload } from './bridge-message-payload'
+
 // Claude Code strips env vars when spawning MCP servers.
 // Workaround: covering-bridge runs `sh -c 'printf "roomId" > /tmp/claude-bridge-room-$$; exec claude ...'`
 // exec replaces sh with node-claude, keeping the same PID (X).
@@ -62,8 +64,9 @@ function getRoomAndTokenFromPidFile(): { roomId: string; token: string } {
   return { roomId: '', token: '' }
 }
 
-const { roomId: pidFileRoom } = getRoomAndTokenFromPidFile()
+const { roomId: pidFileRoom, token: pidFileToken } = getRoomAndTokenFromPidFile()
 const ROOM_ID = process.env.CODEX_BRIDGE_ROOM || pidFileRoom
+const BRIDGE_TOKEN = process.env.CODEX_BRIDGE_TOKEN || pidFileToken
 const BRIDGE_URL = process.env.CODEX_BRIDGE_URL ?? 'http://localhost:8788'
 const POLL_TIMEOUT_MS = 30000
 const POLL_BACKOFF_MS = 1000
@@ -74,40 +77,41 @@ if (!ROOM_ID) {
   process.exit(1)
 }
 
-const BASE = `${BRIDGE_URL}/api/rooms/${encodeURIComponent(ROOM_ID)}`
-
-// ── Fetch role config (retry up to 5s to handle race with room creation) ──
-async function fetchRoleConfig(): Promise<{ name: string; claudeRole: string; codexRole: string } | null> {
-  for (let i = 0; i < 5; i++) {
-    try {
-      const res = await fetch(`${BASE}/config`, { signal: AbortSignal.timeout(3000) })
-      if (res.ok) {
-        const data = await res.json() as { roleTemplate: { name: string; claudeRole: string; codexRole: string } | null }
-        return data.roleTemplate
-      }
-    } catch {}
-    await Bun.sleep(1000)
-  }
-  return null
+if (!BRIDGE_TOKEN) {
+  process.stderr.write('claude-mcp: session token not found — use bridge-claude wrapper or set CODEX_BRIDGE_TOKEN\n')
+  process.exit(1)
 }
 
-const roleConfig = await fetchRoleConfig()
+const BASE = `${BRIDGE_URL}/api/rooms/${encodeURIComponent(ROOM_ID)}`
+const AUTH_HEADERS = { 'x-bridge-token': BRIDGE_TOKEN } as const
 
-const baseInstructions = [
-  `You are connected to Codex Bridge, room ${ROOM_ID}.`,
-  'Messages from Codex arrive as <channel source="codex-bridge" sender="codex" ...>.',
-  'Reply with the reply tool. ALWAYS pass reply_to with the message_id — critical for routing.',
-  `Web UI: ${BRIDGE_URL}`,
-]
+function mergeHeaders(base?: HeadersInit): Record<string, string> {
+  if (!base) return { ...AUTH_HEADERS }
+  if (base instanceof Headers) {
+    const out: Record<string, string> = {}
+    base.forEach((v, k) => { out[k] = v })
+    return { ...out, ...AUTH_HEADERS }
+  }
+  if (Array.isArray(base)) {
+    return { ...Object.fromEntries(base), ...AUTH_HEADERS }
+  }
+  return { ...(base as Record<string, string>), ...AUTH_HEADERS }
+}
 
-if (roleConfig) {
-  baseInstructions.push(
-    '',
-    `=== 역할 템플릿: ${roleConfig.name} ===`,
-    roleConfig.claudeRole,
-    '이 역할에 맞게 Codex와 대화하세요. 역할에 어긋나는 단순 동의나 중립 응답은 피하세요.',
-  )
-  process.stderr.write(`[claude-mcp] role applied: ${roleConfig.name}\n`)
+async function bridgeFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${BASE}${path}`, {
+    ...init,
+    headers: mergeHeaders(init?.headers),
+  })
+}
+
+function failAuth(status: number, where: string): never {
+  process.stderr.write(`[claude-mcp] ${where} returned ${status} — exiting\n`)
+  process.exit(0)
+}
+
+function exitOnAuthFail(status: number, where: string): void {
+  if (status === 401 || status === 404) failAuth(status, where)
 }
 
 // ── MCP server ──
@@ -116,7 +120,15 @@ const mcp = new Server(
   { name: `codex-bridge:${ROOM_ID}`, version: '0.3.0' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
-    instructions: baseInstructions.join('\n'),
+    instructions: [
+      `You are connected to Codex Bridge, room ${ROOM_ID}.`,
+      'Messages from Codex arrive as <channel source="codex-bridge" sender="codex" message_id="..." ...>.',
+      'The message_id attribute in the channel tag is what you pass as reply_to.',
+      'For implementation, verification, or multi-step requests, call mark_in_progress with the message_id within 30 seconds before starting the longer work.',
+      'If you cannot start the requested work, reply immediately instead of leaving the request delivered but unclaimed.',
+      'Reply with the reply tool. ALWAYS pass reply_to with the message_id — critical for routing.',
+      `Web UI: ${BRIDGE_URL}`,
+    ].join('\n'),
   },
 )
 
@@ -131,7 +143,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           text: { type: 'string' },
           reply_to: { type: 'string', description: 'message_id of the message being replied to' },
         },
-        required: ['text'],
+        required: ['text', 'reply_to'],
       },
     },
     {
@@ -146,15 +158,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
-      name: 'edit_message',
-      description: 'Edit a previously sent message in the web UI.',
+      name: 'mark_in_progress',
+      description: 'Mark a Codex request as actively in progress so Codex can distinguish long-running work from silence.',
       inputSchema: {
         type: 'object',
         properties: {
-          message_id: { type: 'string' },
-          text: { type: 'string' },
+          reply_to: { type: 'string', description: 'message_id of the Codex message being worked on' },
+          note: { type: 'string', description: 'Optional short status note, e.g. "running tests"' },
         },
-        required: ['message_id', 'text'],
+        required: ['reply_to'],
       },
     },
   ],
@@ -165,36 +177,75 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     switch (req.params.name) {
       case 'reply': {
-        const text = args.text as string
         const replyTo = args.reply_to as string | undefined
-        const res = await fetch(`${BASE}/from-claude`, {
+        if (!replyTo?.trim()) {
+          return { content: [{ type: 'text', text: 'reply: reply_to is required — pass the message_id from the channel notification' }], isError: true }
+        }
+
+        const validation = validateBridgeTextPayload(args.text)
+        if (validation.ok === false) {
+          return { content: [{ type: 'text', text: `reply: ${validation.error}` }], isError: true }
+        }
+
+        const text = validation.text
+        const res = await bridgeFetch('/from-claude', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ text, replyTo, proactive: false }),
         })
+        exitOnAuthFail(res.status, 'reply/from-claude')
         if (!res.ok) throw new Error(`bridge error: ${res.status}`)
         const { id } = await res.json() as { id: string }
         return { content: [{ type: 'text', text: `sent (${id})` }] }
       }
 
       case 'send_to_codex': {
-        const text = args.text as string
-        const res = await fetch(`${BASE}/from-claude`, {
+        const validation = validateBridgeTextPayload(args.text)
+        if (validation.ok === false) {
+          return { content: [{ type: 'text', text: `send_to_codex: ${validation.error}` }], isError: true }
+        }
+
+        const text = validation.text
+        const res = await bridgeFetch('/from-claude', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ text, proactive: true }),
         })
+        exitOnAuthFail(res.status, 'send_to_codex/from-claude')
         if (!res.ok) throw new Error(`bridge error: ${res.status}`)
         const { id } = await res.json() as { id: string }
         return { content: [{ type: 'text', text: `sent to codex (${id})` }] }
       }
 
-      case 'edit_message': {
-        // Best-effort: no edit endpoint on bridge-server yet, log locally
-        process.stderr.write(`[claude-mcp] edit_message not yet forwarded to bridge\n`)
-        return { content: [{ type: 'text', text: 'ok' }] }
-      }
+      case 'mark_in_progress': {
+        const replyTo = args.reply_to as string | undefined
+        if (!replyTo?.trim()) {
+          return { content: [{ type: 'text', text: 'mark_in_progress: reply_to is required' }], isError: true }
+        }
 
+        const noteValidation = args.note === undefined
+          ? null
+          : validateBridgeTextPayload(args.note)
+        if (noteValidation && noteValidation.ok === false) {
+          return { content: [{ type: 'text', text: `mark_in_progress: ${noteValidation.error}` }], isError: true }
+        }
+
+        const note = noteValidation?.ok ? noteValidation.text : undefined
+        const res = await bridgeFetch(`/reply-progress/${encodeURIComponent(replyTo.trim())}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ note }),
+        })
+        exitOnAuthFail(res.status, 'mark_in_progress/reply-progress')
+        if (!res.ok) throw new Error(`bridge error: ${res.status}`)
+        const { status } = await res.json() as { status: { summary?: string } }
+        return {
+          content: [{
+            type: 'text',
+            text: `marked in progress${status?.summary ? `: ${status.summary}` : ''}`,
+          }],
+        }
+      }
       default:
         return { content: [{ type: 'text', text: `unknown: ${req.params.name}` }], isError: true }
     }
@@ -212,8 +263,8 @@ const CLAUDE_HEARTBEAT_INTERVAL_MS = 1000
 
 async function heartbeat() {
   try {
-    const res = await fetch(`${BASE}/claude/connect`, { method: 'POST', signal: AbortSignal.timeout(5000) })
-    if (res.status === 404) {
+    const res = await bridgeFetch('/claude/connect', { method: 'POST', signal: AbortSignal.timeout(5000) })
+    if (res.status === 401 || res.status === 404) {
       process.stderr.write(`[claude-mcp] room ${ROOM_ID} closed — exiting\n`)
       process.exit(0)
     }
@@ -222,7 +273,7 @@ async function heartbeat() {
 
 async function unregister() {
   try {
-    await fetch(`${BASE}/claude/connect`, { method: 'DELETE', signal: AbortSignal.timeout(3000) })
+    await bridgeFetch('/claude/connect', { method: 'DELETE', signal: AbortSignal.timeout(3000) })
   } catch {}
 }
 
@@ -247,10 +298,11 @@ async function deliverToClaude(id: string, text: string, sender: string) {
 async function pollLoop() {
   while (true) {
     try {
-      const res = await fetch(
-        `${BASE}/pending-for-claude?timeout=${POLL_TIMEOUT_MS}`,
+      const res = await bridgeFetch(
+        `/pending-for-claude?timeout=${POLL_TIMEOUT_MS}`,
         { signal: AbortSignal.timeout(POLL_TIMEOUT_MS + 5000) },
       )
+      exitOnAuthFail(res.status, 'pollLoop/pending-for-claude')
       if (!res.ok) {
         await Bun.sleep(POLL_BACKOFF_MS)
         continue

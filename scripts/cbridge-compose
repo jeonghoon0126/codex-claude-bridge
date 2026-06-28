@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+HOME_DIR="${HOME:-/Users/wjh}"
+BRIDGE_DIR="${CBRIDGE_DIR:-$HOME_DIR/codex-claude-bridge}"
+BUN_BIN="${BUN_BIN:-$HOME_DIR/.bun/bin/bun}"
+
+exec "$BUN_BIN" "$BRIDGE_DIR/covering-bridge.ts" compose "${1:-}" "${2:-}"

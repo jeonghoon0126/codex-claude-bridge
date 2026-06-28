@@ -10,13 +10,11 @@
  *   env = { CODEX_BRIDGE_ROOM = "ENG-1234" }
  *
  * Or set CODEX_BRIDGE_ROOM before launching:
- *   CODEX_BRIDGE_ROOM=ENG-1234 codex --full-auto
+ *   CODEX_BRIDGE_ROOM=ENG-1234 codex --dangerously-bypass-approvals-and-sandbox
  *
  * Tools:
- *   send_to_claude(message) — Send a message to Claude. Blocks until Claude replies (~60 min max).
+ *   send_to_claude(message) — Send a message to Claude. Blocks until Claude replies (~2 min max).
  *   check_claude_messages() — Check if Claude has sent any proactive messages.
- *   send_to_codex_peer(message) — Alias for Codex-Codex rooms.
- *   check_codex_peer_messages() — Alias for Codex-Codex rooms.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -27,51 +25,38 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { execFileSync } from 'child_process'
 import { readFileSync } from 'fs'
-import { codexMcpTotalWaitMs } from './bridge-timeouts.ts'
+
+import {
+  normalizeBridgeMessage,
+  validateBridgeTextPayload,
+} from './bridge-message-payload'
+import { formatReplyProgressStatus, type ReplyProgressSnapshot } from './bridge-reply-progress'
+import { DEFAULT_REPLY_WAIT_POLICY, shouldKeepWaitingForReply } from './reply-wait-policy'
 
 const BRIDGE_URL = process.env.CODEX_BRIDGE_URL ?? 'http://localhost:8788'
-const PEER_NAME = process.env.CODEX_BRIDGE_PEER_NAME ?? 'Codex peer'
-const TOTAL_WAIT_MS = codexMcpTotalWaitMs()
 const POLL_SLICE_MS = 15000
 const POLL_ABORT_GRACE_MS = 3000
 
-// Codex may strip env vars when spawning MCP servers.
-// Fallback: bridge-codex writes /tmp/codex-bridge-room-<pid> before execing Codex.
-// Process ancestry differs between Codex releases, so walk nearby parents instead of
-// relying on one fixed parent depth.
+const REPLY_WAIT_POLICY = (() => {
+  const override = Number(process.env.CODEX_BRIDGE_MAX_WAIT_MS)
+  if (!Number.isFinite(override) || override <= 0) return DEFAULT_REPLY_WAIT_POLICY
+  return { ...DEFAULT_REPLY_WAIT_POLICY, maxWaitMs: override }
+})()
+
+// Codex strips most env vars when spawning MCP servers (only HOME/LANG/PATH survive).
+// Fallback: covering-bridge starts Codex via `sh -c 'printf "roomId:token" > /tmp/codex-bridge-room-$$; exec codex'`.
+// Because exec replaces sh without changing PID, $$ == the node-wrapper PID.
+// codex-mcp.ts traverses: process.ppid (codex binary) → its PPID (node wrapper) → reads the file.
 function getRoomAndTokenFromPidFile(): { roomId: string; token: string } {
-  const readBridgeFile = (pid: number) => {
-    try {
-      return readFileSync(`/tmp/codex-bridge-room-${pid}`, 'utf8').trim()
-    } catch {
-      return ''
-    }
-  }
-
-  const parentPid = (pid: number) => {
-    try {
-      const raw = execFileSync('ps', ['-o', 'ppid=', '-p', String(pid)], { timeout: 2000 })
-        .toString().trim()
-      const parsed = parseInt(raw, 10)
-      return parsed && !isNaN(parsed) ? parsed : 0
-    } catch {
-      return 0
-    }
-  }
-
   try {
-    const seen = new Set<number>()
-    let pid = process.pid
-    let content = ''
-
-    for (let i = 0; i < 8 && pid > 1 && !seen.has(pid); i++) {
-      seen.add(pid)
-      content = readBridgeFile(pid)
-      if (content) break
-      pid = parentPid(pid)
-    }
-
-    if (!content) return { roomId: '', token: '' }
+    const codexBinaryPid = process.ppid
+    const nodeWrapperPid = parseInt(
+      execFileSync('ps', ['-o', 'ppid=', '-p', String(codexBinaryPid)], { timeout: 2000 })
+        .toString().trim(),
+      10,
+    )
+    if (!nodeWrapperPid || isNaN(nodeWrapperPid)) return { roomId: '', token: '' }
+    const content = readFileSync(`/tmp/codex-bridge-room-${nodeWrapperPid}`, 'utf8').trim()
     const idx = content.indexOf(':')
     if (idx === -1) return { roomId: content, token: '' }
     return { roomId: content.slice(0, idx), token: content.slice(idx + 1) }
@@ -80,166 +65,270 @@ function getRoomAndTokenFromPidFile(): { roomId: string; token: string } {
   }
 }
 
-const { roomId: pidFileRoom } = getRoomAndTokenFromPidFile()
+const { roomId: pidFileRoom, token: pidFileToken } = getRoomAndTokenFromPidFile()
 const ROOM_ID = process.env.CODEX_BRIDGE_ROOM || pidFileRoom
-const HAS_ROOM = Boolean(ROOM_ID)
+const BRIDGE_TOKEN = process.env.CODEX_BRIDGE_TOKEN || pidFileToken
 
-if (!HAS_ROOM) {
-  process.stderr.write('codex-mcp: no bridge room bound; starting without bridge tools\n')
+if (!ROOM_ID) {
+  process.stderr.write(
+    'codex-mcp: room not found — set CODEX_BRIDGE_ROOM or use bridge-codex to open rooms\n',
+  )
+  process.exit(1)
 }
 
-const BASE = HAS_ROOM ? `${BRIDGE_URL}/api/rooms/${encodeURIComponent(ROOM_ID)}` : ''
+if (!BRIDGE_TOKEN) {
+  process.stderr.write(
+    'codex-mcp: session token not found — use bridge-codex wrapper or set CODEX_BRIDGE_TOKEN\n',
+  )
+  process.exit(1)
+}
 
-// ── Fetch role config (retry up to 5s to handle race with room creation) ──
-async function fetchRoleConfig(): Promise<{ name: string; codexRole: string } | null> {
-  if (!HAS_ROOM) return null
+const BASE = `${BRIDGE_URL}/api/rooms/${encodeURIComponent(ROOM_ID)}`
+const AUTH_HEADERS = { 'x-bridge-token': BRIDGE_TOKEN } as const
 
-  for (let i = 0; i < 5; i++) {
-    try {
-      const res = await fetch(`${BASE}/config`, { signal: AbortSignal.timeout(3000) })
-      if (res.ok) {
-        const data = await res.json() as { roleTemplate: { name: string; claudeRole: string; codexRole: string } | null }
-        if (data.roleTemplate) return { name: data.roleTemplate.name, codexRole: data.roleTemplate.codexRole }
-      }
-    } catch {}
-    await Bun.sleep(1000)
+function mergeHeaders(base?: HeadersInit): Record<string, string> {
+  if (!base) return { ...AUTH_HEADERS }
+  if (base instanceof Headers) {
+    const out: Record<string, string> = {}
+    base.forEach((v, k) => { out[k] = v })
+    return { ...out, ...AUTH_HEADERS }
   }
-  return null
+  if (Array.isArray(base)) {
+    return { ...Object.fromEntries(base), ...AUTH_HEADERS }
+  }
+  return { ...(base as Record<string, string>), ...AUTH_HEADERS }
 }
 
-const roleConfig = await fetchRoleConfig()
-if (roleConfig) {
-  process.stderr.write(`[codex-mcp] role applied: ${roleConfig.name}\n`)
+async function bridgeFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${BASE}${path}`, {
+    ...init,
+    headers: mergeHeaders(init?.headers),
+  })
+}
+
+function failAuth(status: number, where: string): never {
+  process.stderr.write(`[codex-mcp] ${where} returned ${status} — exiting\n`)
+  process.exit(0)
+}
+
+function exitOnAuthFail(status: number, where: string): void {
+  if (status === 401 || status === 404) failAuth(status, where)
 }
 
 type ToolResult = { content: { type: 'text'; text: string }[]; isError?: boolean }
 
-const inFlightMessages = new Map<string, Promise<ToolResult>>()
-
-function normalizeMessage(message: string) {
-  return message.trim().replace(/\s+/g, ' ')
+type ReplyStatusInfo = {
+  status: ReplyProgressSnapshot & { summary?: string }
+  peerAlive: boolean
+  assistantLabel?: string
+  assistantName?: string
 }
+
+type WorktreeSnapshot = {
+  root: string
+  branch: string
+  head: string
+  statusShort: string
+  diffNameStatus: string
+  diffShortStat: string
+}
+
+const inFlightMessages = new Map<string, Promise<ToolResult>>()
 
 function formatElapsedMs(startMs: number) {
   return `${Math.round((Date.now() - startMs) / 1000)}s`
 }
 
+function gitOutput(args: string[], cwd = process.cwd()) {
+  return execFileSync('git', args, { cwd, timeout: 3000 }).toString().trim()
+}
+
+function captureWorktreeSnapshot(): WorktreeSnapshot | null {
+  try {
+    const root = gitOutput(['rev-parse', '--show-toplevel'])
+    return {
+      root,
+      branch: gitOutput(['rev-parse', '--abbrev-ref', 'HEAD'], root),
+      head: gitOutput(['rev-parse', '--short', 'HEAD'], root),
+      statusShort: gitOutput(['status', '--short'], root),
+      diffNameStatus: gitOutput(['diff', '--name-status'], root),
+      diffShortStat: gitOutput(['diff', '--shortstat'], root),
+    }
+  } catch {
+    return null
+  }
+}
+
+function compactMultiline(label: string, text: string) {
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean)
+  if (lines.length === 0) return `${label}=clean`
+  const shown = lines.slice(0, 8).join('; ')
+  const suffix = lines.length > 8 ? `; ...(+${lines.length - 8})` : ''
+  return `${label}=${shown}${suffix}`
+}
+
+function formatWorktreeEvidence(before: WorktreeSnapshot | null, after: WorktreeSnapshot | null) {
+  if (!before && !after) return ['worktree_evidence=unavailable']
+  if (!before || !after) return ['worktree_evidence=partial']
+
+  const unchanged = before.root === after.root
+    && before.branch === after.branch
+    && before.head === after.head
+    && before.statusShort === after.statusShort
+    && before.diffNameStatus === after.diffNameStatus
+    && before.diffShortStat === after.diffShortStat
+
+  return [
+    `worktree_root=${after.root}`,
+    `worktree_before=${before.branch}@${before.head}`,
+    `worktree_after=${after.branch}@${after.head}`,
+    `worktree_delta=${unchanged ? 'unchanged' : 'changed'}`,
+    compactMultiline('worktree_status', after.statusShort),
+    compactMultiline('worktree_diff', after.diffNameStatus),
+    compactMultiline('worktree_diff_stat', after.diffShortStat),
+  ]
+}
+
+type HandoffCloseReason = 'wait_policy_closed' | 'max_wait_exhausted'
+
+function formatHandoffStatus(info?: ReplyStatusInfo, reason: HandoffCloseReason = 'wait_policy_closed') {
+  if (!info) return 'status_unknown'
+  if (info.status.state === 'queued') return info.peerAlive ? 'queued_not_delivered' : 'queued_peer_inactive'
+  if (info.status.state === 'delivered') return 'delivered_not_claimed'
+  if (info.status.state === 'in_progress') {
+    return reason === 'max_wait_exhausted'
+      ? 'in_progress_wait_window_exhausted'
+      : 'in_progress_no_recent_update'
+  }
+  return 'replied_not_collected'
+}
+
+function formatHandoffNotReadyMessage(
+  id: string,
+  startMs: number,
+  info?: ReplyStatusInfo,
+  reason: HandoffCloseReason = 'wait_policy_closed',
+  beforeSnapshot: WorktreeSnapshot | null = null,
+  afterSnapshot: WorktreeSnapshot | null = null,
+) {
+  const elapsed = formatElapsedMs(startMs)
+  const assistantName = info?.assistantName ?? 'Claude'
+  const detail = info
+    ? info.status.summary ?? formatReplyProgressStatus(info.status, Date.now(), assistantName)
+    : 'bridge에서 reply-status를 확인하지 못했습니다.'
+
+  return [
+    `${assistantName} handoff는 등록됐지만 최종 답변은 아직 준비되지 않았습니다.`,
+    `handoff_id=${id}`,
+    `elapsed=${elapsed}`,
+    `status=${formatHandoffStatus(info, reason)}`,
+    `peer_alive=${info?.peerAlive ? 'true' : 'false'}`,
+    `detail=${detail}`,
+    ...formatWorktreeEvidence(beforeSnapshot, afterSnapshot),
+    '같은 본문은 재전송하지 마세요. 필요하면 `check_claude_messages`로 이 handoff의 상태나 늦게 도착한 답변만 확인하세요.',
+    'Codex는 이 handoff의 실행 범위를 로컬에서 이어받지 마세요. 허용되는 다음 행동은 상태 확인, 대기, 또는 사용자에게 takeover 여부를 묻는 것뿐입니다.',
+  ].join('\n')
+}
+
+async function fetchReplyStatus(id: string): Promise<ReplyStatusInfo | null> {
+  const res = await bridgeFetch(`/reply-status/${id}`)
+  exitOnAuthFail(res.status, 'send_to_claude/reply-status')
+  if (!res.ok) return null
+  const data = await res.json() as {
+    found: boolean
+    peerAlive?: boolean
+    assistantLabel?: string
+    assistantName?: string
+    status?: ReplyProgressSnapshot & { summary?: string }
+  }
+  if (!data.found || !data.status) return null
+  return {
+    status: data.status,
+    peerAlive: data.peerAlive ?? false,
+    assistantLabel: data.assistantLabel,
+    assistantName: data.assistantName,
+  }
+}
+
+async function ackReply(id: string): Promise<void> {
+  try {
+    const res = await bridgeFetch(`/ack-reply/${id}`, { method: 'POST' })
+    if (res.status === 401) {
+      process.stderr.write('[codex-mcp] send_to_claude/ack-reply returned 401; ignoring optional ack failure\n')
+    }
+  } catch {}
+}
+
 const mcp = new Server(
-  { name: `codex-bridge-client:${ROOM_ID || 'unbound'}`, version: '0.3.0' },
+  { name: `codex-bridge-client:${ROOM_ID}`, version: '0.3.0' },
   { capabilities: { tools: {} } },
 )
 
-const rolePreamble = roleConfig
-  ? [
-      `=== 역할 템플릿: ${roleConfig.name} ===`,
-      roleConfig.codexRole,
-      '이 역할에 맞게 상대 에이전트와 대화하세요. 역할에 어긋나는 단순 동의나 중립 응답은 피하세요.',
-      '',
-    ].join(' ')
-  : ''
-
-mcp.setRequestHandler(ListToolsRequestSchema, async () => {
-  if (!HAS_ROOM) return { tools: [] }
-
-  return {
-    tools: [
-      {
-        name: 'send_to_claude',
-        description: [
-          rolePreamble,
-          `Send a message to Claude Code through Codex Bridge (room: ${ROOM_ID}) and wait for a reply.`,
-          'This tool blocks until Claude responds (up to about 60 minutes).',
-          'Use this to collaborate with Claude: ask questions, propose approaches,',
-          'debate architecture decisions, or reach consensus on implementation details.',
-          '',
-          'IMPORTANT: This is a conversation tool. If Claude replies with a question,',
-          'a counter-proposal, or consensus has not been reached, call this tool AGAIN.',
-          'Keep calling it until you and Claude have fully resolved the topic.',
-          'Do not call this tool concurrently with the same message.',
-          'If it times out, do not immediately resend the exact same prompt.',
-        ].filter(Boolean).join(' '),
-        inputSchema: {
-          type: 'object',
-          properties: {
-            message: { type: 'string', description: 'The message to send to Claude' },
-          },
-          required: ['message'],
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: 'send_to_claude',
+      description: [
+        `Send a message through Codex Bridge (room: ${ROOM_ID}) and wait for the assistant-side reply.`,
+        'The assistant side may be Claude Code or, in a codex-backed room, a peer Codex session.',
+        'This tool waits in short slices and returns a handoff status instead of encouraging duplicate resend when the final reply is not ready.',
+        'For tiny relays or short pings, send the real non-empty message directly and do not run unrelated preflight checks first.',
+        'For non-trivial work, send an outcome-first bounded handoff with Role, Goal, Success criteria, Source context/evidence, Constraints, Plan or Task slice, Allowed tools/edits, Tool notes, Verification, Output, and Stop rules.',
+        'Non-trivial handoffs use one of two prefixes: `[Codex execution handoff]` (Role: executor) for implementation/code-improvement slices, or `[Codex verification handoff]` (Role: verifier only) for ticket-contract Verification Matrix replay. Verification mode requires a `Requirement contract:` absolute path and is read-only.',
+        'In codex-backed rooms, the peer Codex must be treated as executor or verifier only for the assigned slice; never as planner, reviewer, or consensus partner. Keep problem framing, design decisions, and final keep/revise/abort judgment in the caller Codex.',
+        '',
+        'IMPORTANT: If the assistant replies with a blocker or question, call this tool again only with the narrowed answer or next bounded slice.',
+        'Do not call this tool concurrently with the same message.',
+        'If it times out, do not immediately resend the exact same prompt and do not start executing the delegated slice locally. Wait, check handoff status/late replies, or ask the user before any takeover.',
+      ].join(' '),
+      inputSchema: {
+        type: 'object',
+        properties: {
+          message: { type: 'string', description: 'The message to send to Claude' },
         },
+        required: ['message'],
       },
-      {
-        name: 'send_to_codex_peer',
-        description: [
-          rolePreamble,
-          `Send a message to the second Codex agent through Codex Bridge (room: ${ROOM_ID}) and wait for a reply.`,
-          'This tool blocks until the Codex peer responds.',
-          'Use this when running bridge-codex-peer on the responder side.',
-          'Keep calling it until the discussion has fully resolved the topic.',
-          'Do not call this tool concurrently with the same message.',
-        ].filter(Boolean).join(' '),
-        inputSchema: {
-          type: 'object',
-          properties: {
-            message: { type: 'string', description: 'The message to send to the Codex peer' },
-          },
-          required: ['message'],
-        },
-      },
-      {
-        name: 'check_claude_messages',
-        description: [
-          'Check if Claude has sent any proactive messages in this room.',
-          'Returns pending messages from Claude that you have not seen yet.',
-        ].join(' '),
-        inputSchema: { type: 'object', properties: {} },
-      },
-      {
-        name: 'check_codex_peer_messages',
-        description: [
-          'Check if the Codex peer has sent any proactive messages in this room.',
-          'Returns pending messages from the Codex peer that you have not seen yet.',
-        ].join(' '),
-        inputSchema: { type: 'object', properties: {} },
-      },
-    ],
-  }
-})
+    },
+    {
+      name: 'check_claude_messages',
+      description: [
+        'Check if Claude has sent any proactive messages in this room.',
+        'Returns pending messages from Claude that you have not seen yet.',
+        'Use this after a real handoff or when explicitly checking pending proactive messages.',
+        'Do not use it as a preflight step before the first non-empty send_to_claude call.',
+      ].join(' '),
+      inputSchema: { type: 'object', properties: {} },
+    },
+  ],
+}))
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = (req.params.arguments ?? {}) as Record<string, unknown>
 
-  if (!HAS_ROOM) {
-    return {
-      content: [{
-        type: 'text',
-        text: 'error: Codex Bridge room is not configured for this Codex session.',
-      }],
-      isError: true,
-    }
-  }
-
   try {
     switch (req.params.name) {
-      case 'send_to_claude':
-      case 'send_to_codex_peer': {
-        const message = args.message as string
-        const peerName = req.params.name === 'send_to_codex_peer' ? PEER_NAME : 'Claude'
-        if (!message?.trim()) {
-          return { content: [{ type: 'text', text: 'error: empty message' }], isError: true }
+      case 'send_to_claude': {
+        const validation = validateBridgeTextPayload(args.message)
+        if (validation.ok === false) {
+          return { content: [{ type: 'text', text: `error: ${validation.error}` }], isError: true }
         }
 
-        const normalized = normalizeMessage(message)
+        const message = validation.text
+        const normalized = normalizeBridgeMessage(message)
         const existing = inFlightMessages.get(normalized)
         if (existing) return await existing
 
         const requestPromise: Promise<ToolResult> = (async () => {
           const startedAt = Date.now()
+          const beforeSnapshot = captureWorktreeSnapshot()
 
           // Send message to bridge
-          const sendRes = await fetch(`${BASE}/from-codex`, {
+          const sendRes = await bridgeFetch('/from-codex', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ message: message.trim() }),
+            body: JSON.stringify({ message }),
           })
+          exitOnAuthFail(sendRes.status, 'send_to_claude/from-codex')
 
           if (!sendRes.ok) {
             const err = await sendRes.text()
@@ -252,16 +341,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           const { id } = await sendRes.json() as { id: string }
 
           // Poll in short slices to avoid transport-layer timeouts
-          while (Date.now() - startedAt < TOTAL_WAIT_MS) {
-            const remainingMs = TOTAL_WAIT_MS - (Date.now() - startedAt)
+          while (true) {
+            const elapsedMs = Date.now() - startedAt
+            if (elapsedMs >= REPLY_WAIT_POLICY.maxWaitMs) break
+
+            const remainingMs = REPLY_WAIT_POLICY.maxWaitMs - elapsedMs
             const pollTimeoutMs = Math.min(POLL_SLICE_MS, remainingMs)
             const controller = new AbortController()
             const clientTimeout = setTimeout(() => controller.abort(), pollTimeoutMs + POLL_ABORT_GRACE_MS)
             let pollRes: Response
 
             try {
-              pollRes = await fetch(
-                `${BASE}/poll-reply/${id}?timeout=${pollTimeoutMs}`,
+              pollRes = await bridgeFetch(
+                `/poll-reply/${id}?timeout=${pollTimeoutMs}`,
                 { signal: controller.signal },
               )
             } catch (e: unknown) {
@@ -271,6 +363,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               throw e
             }
             clearTimeout(clientTimeout)
+            exitOnAuthFail(pollRes.status, 'send_to_claude/poll-reply')
 
             if (!pollRes.ok) {
               const errText = await pollRes.text()
@@ -283,6 +376,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             const result = await pollRes.json() as { timeout: boolean; reply: string | null }
 
             if (result.reply) {
+              await ackReply(id)
               return { content: [{ type: 'text', text: result.reply }] }
             }
 
@@ -290,16 +384,54 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               return {
                 content: [{
                   type: 'text',
-                  text: `${peerName} returned no reply after ${formatElapsedMs(startedAt)}. Do not immediately resend the same prompt.`,
+                  text: [
+                    'Claude handoff는 완료됐지만 빈 응답이 반환됐습니다.',
+                    `handoff_id=${id}`,
+                    `elapsed=${formatElapsedMs(startedAt)}`,
+                    'status=empty_reply',
+                    ...formatWorktreeEvidence(beforeSnapshot, captureWorktreeSnapshot()),
+                    '같은 본문은 재전송하지 말고 `check_claude_messages`로 늦게 도착한 후속 메시지만 확인하세요.',
+                  ].join('\n'),
+                }],
+              }
+            }
+
+            const replyStatus = await fetchReplyStatus(id)
+            if (!shouldKeepWaitingForReply(
+              startedAt,
+              replyStatus?.status,
+              undefined,
+              REPLY_WAIT_POLICY,
+              replyStatus?.peerAlive ?? false,
+            )) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: formatHandoffNotReadyMessage(
+                    id,
+                    startedAt,
+                    replyStatus ?? undefined,
+                    'wait_policy_closed',
+                    beforeSnapshot,
+                    captureWorktreeSnapshot(),
+                  ),
                 }],
               }
             }
           }
 
+          const replyStatus = await fetchReplyStatus(id)
           return {
             content: [{
               type: 'text',
-              text: `${peerName} did not reply within ${formatElapsedMs(startedAt)}. Do not immediately resend the same prompt.`,
+              text: formatHandoffNotReadyMessage(
+                id,
+                startedAt,
+                replyStatus ?? undefined,
+                'max_wait_exhausted',
+                beforeSnapshot,
+                captureWorktreeSnapshot(),
+              ),
             }],
           }
         })()
@@ -314,22 +446,38 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
       }
 
-      case 'check_claude_messages':
-      case 'check_codex_peer_messages': {
-        const peerName = req.params.name === 'check_codex_peer_messages' ? PEER_NAME : 'Claude'
-        const res = await fetch(`${BASE}/pending-for-codex`)
+      case 'check_claude_messages': {
+        const res = await bridgeFetch('/pending-for-codex')
+        exitOnAuthFail(res.status, 'check_claude_messages')
         if (!res.ok) {
           return {
             content: [{ type: 'text', text: `error checking messages: ${res.status}` }],
             isError: true,
           }
         }
-        const { messages } = await res.json() as { messages: { id: string; text: string }[] }
-        if (messages.length === 0) {
-          return { content: [{ type: 'text', text: `No pending messages from ${peerName}.` }] }
+        const payload = await res.json() as {
+          messages: { id: string; text: string }[]
+          statuses?: Array<ReplyProgressSnapshot & { summary?: string }>
+          assistantName?: string
         }
-        const formatted = messages.map(m => `[${m.id}] ${m.text}`).join('\n\n---\n\n')
-        return { content: [{ type: 'text', text: `${messages.length} message(s) from ${peerName}:\n\n${formatted}` }] }
+        const messages = payload.messages
+        const statuses = payload.statuses ?? []
+        const assistantName = payload.assistantName ?? 'Claude'
+        if (messages.length === 0 && statuses.length === 0) {
+          return { content: [{ type: 'text', text: `No pending messages from ${assistantName}.` }] }
+        }
+        const sections: string[] = []
+        if (messages.length > 0) {
+          const formattedMessages = messages.map(m => `[${m.id}] ${m.text}`).join('\n\n---\n\n')
+          sections.push(`${messages.length} message(s) from ${assistantName}:\n\n${formattedMessages}`)
+        }
+        if (statuses.length > 0) {
+          const formattedStatuses = statuses
+            .map(status => `[${status.id}] ${status.summary ?? formatReplyProgressStatus(status, Date.now(), assistantName)}`)
+            .join('\n\n---\n\n')
+          sections.push(`Active ${assistantName} work:\n\n${formattedStatuses}`)
+        }
+        return { content: [{ type: 'text', text: sections.join('\n\n===\n\n') }] }
       }
 
       default:
@@ -359,16 +507,14 @@ function isParentAlive(): boolean {
 }
 
 async function heartbeat() {
-  if (!HAS_ROOM) return
-
   if (!isParentAlive()) {
     process.stderr.write(`[codex-mcp] parent gone — exiting\n`)
     await unregister()
     process.exit(0)
   }
   try {
-    const res = await fetch(`${BASE}/codex/heartbeat`, { method: 'POST', signal: AbortSignal.timeout(5000) })
-    if (res.status === 404) {
+    const res = await bridgeFetch('/codex/heartbeat', { method: 'POST', signal: AbortSignal.timeout(5000) })
+    if (res.status === 401 || res.status === 404) {
       process.stderr.write(`[codex-mcp] room ${ROOM_ID} closed — exiting\n`)
       process.exit(0)
     }
@@ -376,10 +522,8 @@ async function heartbeat() {
 }
 
 async function unregister() {
-  if (!HAS_ROOM) return
-
   try {
-    await fetch(`${BASE}/codex/heartbeat`, { method: 'DELETE', signal: AbortSignal.timeout(3000) })
+    await bridgeFetch('/codex/heartbeat', { method: 'DELETE', signal: AbortSignal.timeout(3000) })
   } catch {}
 }
 
@@ -388,8 +532,6 @@ process.on('SIGINT', () => { void unregister().finally(() => process.exit(0)) })
 process.on('SIGTERM', () => { void unregister().finally(() => process.exit(0)) })
 
 await mcp.connect(new StdioServerTransport())
-if (HAS_ROOM) {
-  await heartbeat()
-  setInterval(heartbeat, HEARTBEAT_INTERVAL_MS)
-}
-process.stderr.write(`codex-bridge-client: ready  room=${ROOM_ID || 'unbound'}  bridge=${BRIDGE_URL}\n`)
+await heartbeat()  // immediate ✓ on connect
+setInterval(heartbeat, HEARTBEAT_INTERVAL_MS)  // keep alive every 30s
+process.stderr.write(`codex-bridge-client: ready  room=${ROOM_ID}  bridge=${BRIDGE_URL}\n`)
