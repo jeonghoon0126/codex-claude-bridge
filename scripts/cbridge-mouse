@@ -1,0 +1,61 @@
+#!/bin/zsh
+set -euo pipefail
+
+action="${1:-}"
+pane="${2:-}"
+header_for="${3:-}"
+token="${4:-}"
+TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+
+if [[ ! -x "$TMUX_BIN" ]]; then
+  TMUX_BIN="$(command -v tmux || true)"
+fi
+
+if [[ -z "$TMUX_BIN" || -z "$pane" ]]; then
+  exit 0
+fi
+
+target="$pane"
+if [[ "$header_for" == %* ]]; then
+  target="$header_for"
+fi
+
+pane_in_mode() {
+  "$TMUX_BIN" display-message -p -t "$target" '#{pane_in_mode}' 2>/dev/null || printf '0'
+}
+
+scroll_position() {
+  "$TMUX_BIN" display-message -p -t "$target" '#{scroll_position}' 2>/dev/null || printf ''
+}
+
+cancel_copy_mode_if_at_bottom() {
+  local position
+  position="$(scroll_position)"
+  if [[ -z "$position" || "$position" == "0" ]]; then
+    "$TMUX_BIN" send-keys -t "$target" -X cancel 2>/dev/null || true
+  fi
+}
+
+case "$action" in
+  ack)
+    "$TMUX_BIN" select-pane -t "$target" 2>/dev/null || true
+    if [[ -n "$token" && "$token" != *'#'* ]]; then
+      "$TMUX_BIN" set-option -pt "$target" @cbridge_ack_click "$token" 2>/dev/null || true
+    fi
+    ;;
+  wheel-up)
+    "$TMUX_BIN" select-pane -t "$target" 2>/dev/null || true
+    if [[ "$(pane_in_mode)" != "1" ]]; then
+      "$TMUX_BIN" copy-mode -e -t "$target" 2>/dev/null || true
+    fi
+    "$TMUX_BIN" send-keys -t "$target" -X -N 3 scroll-up 2>/dev/null || true
+    cancel_copy_mode_if_at_bottom
+    ;;
+  wheel-down)
+    "$TMUX_BIN" select-pane -t "$target" 2>/dev/null || true
+    if [[ "$(pane_in_mode)" == "1" ]]; then
+      "$TMUX_BIN" send-keys -t "$target" -X -N 3 scroll-down 2>/dev/null || true
+      cancel_copy_mode_if_at_bottom
+    fi
+    ;;
+esac

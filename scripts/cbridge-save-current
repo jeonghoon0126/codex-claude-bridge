@@ -1,0 +1,23 @@
+#!/bin/zsh
+set -euo pipefail
+
+HOME_DIR="${HOME:-/Users/wjh}"
+BRIDGE_DIR="${CBRIDGE_DIR:-$HOME_DIR/codex-claude-bridge}"
+RESTORE_SCRIPT="$BRIDGE_DIR/scripts/cbridge-restore-latest"
+DISABLE_AUTO_SCRIPT="$BRIDGE_DIR/scripts/cbridge-disable-auto"
+BUN_BIN="${BUN_BIN:-$HOME_DIR/.bun/bin/bun}"
+RESTORE_CODEX_HOME="${CBRIDGE_CODEX_HOME:-${CODEX_HOME:-$HOME_DIR/.codex}}"
+
+export CBRIDGE_CODEX_HOME="$RESTORE_CODEX_HOME"
+export CODEX_HOME="$RESTORE_CODEX_HOME"
+export CBRIDGE_RESTORE_REFRESH_LATEST=0
+export CBRIDGE_RESTORE_SORT_BY_RECENCY=0
+export CBRIDGE_SNAPSHOT_SYNC=1
+export CBRIDGE_CAPTURE_PANES=1
+export CODEX_BRIDGE_PANE_TITLES=0
+
+"$RESTORE_SCRIPT" snapshot
+"$BUN_BIN" "$BRIDGE_DIR/covering-bridge.ts" tmux-pane-titles >/dev/null 2>&1 || true
+"$DISABLE_AUTO_SCRIPT" >/dev/null 2>&1 || true
+
+printf 'cbridge current leader tab layout saved to %s\n' "$HOME_DIR/.codex-claude-bridge/restore-rooms.tsv"

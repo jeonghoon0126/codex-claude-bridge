@@ -1,0 +1,79 @@
+#!/bin/zsh
+set -euo pipefail
+
+HOME_DIR="${HOME:-/Users/wjh}"
+BRIDGE_DIR="${CBRIDGE_DIR:-$HOME_DIR/codex-claude-bridge}"
+RESTORE_SCRIPT="$BRIDGE_DIR/scripts/cbridge-restore-latest"
+LOG_DIR="$HOME_DIR/.codex-claude-bridge/logs"
+LOG_FILE="$LOG_DIR/one-click-restore.log"
+SNAPSHOT_PLIST="$HOME_DIR/Library/LaunchAgents/com.wjh.cbridge-snapshot.plist"
+RESTORE_PLIST="$HOME_DIR/Library/LaunchAgents/com.wjh.cbridge-restore.plist"
+RESTORE_CODEX_HOME="$HOME_DIR/.codex"
+DOMAIN="gui/$(id -u)"
+
+mkdir -p "$LOG_DIR"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
+}
+
+load_agent() {
+  local plist="$1"
+  [[ -f "$plist" ]] || return 0
+  launchctl bootstrap "$DOMAIN" "$plist" >/dev/null 2>&1 || true
+}
+
+unload_agent() {
+  local plist="$1"
+  [[ -f "$plist" ]] || return 0
+  launchctl bootout "$DOMAIN" "$plist" >/dev/null 2>&1 || true
+}
+
+disable_restore_agent() {
+  unload_agent "$RESTORE_PLIST"
+  launchctl disable "$DOMAIN/com.wjh.cbridge-restore" >/dev/null 2>&1 || true
+}
+
+finish() {
+  disable_restore_agent
+  load_agent "$SNAPSHOT_PLIST"
+}
+trap finish EXIT
+
+if [[ ! -x "$RESTORE_SCRIPT" ]]; then
+  log "restore script not executable: $RESTORE_SCRIPT"
+  exit 1
+fi
+
+log "cbridge one-click restore started"
+unload_agent "$SNAPSHOT_PLIST"
+disable_restore_agent
+
+if [[ "${CBRIDGE_RESTORE_FORCE_REBUILD:-1}" == "1" ]]; then
+  log "rebuilding cbridge leader tabs from latest created conversations"
+  restore_force=1
+else
+  log "restoring latest cbridge leader layout without rebuilding active sessions"
+  restore_force="${CBRIDGE_RESTORE_FORCE:-0}"
+fi
+
+CBRIDGE_CODEX_HOME="$RESTORE_CODEX_HOME" \
+CODEX_HOME="$RESTORE_CODEX_HOME" \
+CBRIDGE_RESTORE_REFRESH_LATEST="${CBRIDGE_RESTORE_REFRESH_LATEST:-1}" \
+CBRIDGE_RESTORE_LATEST_ORDER="${CBRIDGE_RESTORE_LATEST_ORDER:-created}" \
+CBRIDGE_RESTORE_FORCE="$restore_force" \
+CBRIDGE_RESTORE_OPEN_WINDOWS="${CBRIDGE_RESTORE_OPEN_WINDOWS:-1}" \
+CBRIDGE_RESTORE_SORT_BY_RECENCY=0 \
+CBRIDGE_CODEX_LEADER_START_DELAY="${CBRIDGE_CODEX_LEADER_START_DELAY:-1}" \
+  "$RESTORE_SCRIPT"
+
+CBRIDGE_CODEX_HOME="$RESTORE_CODEX_HOME" \
+CODEX_HOME="$RESTORE_CODEX_HOME" \
+CBRIDGE_RESTORE_SORT_BY_RECENCY=0 \
+  "$RESTORE_SCRIPT" snapshot
+
+log "cbridge one-click restore finished"
+
+if [[ "${CBRIDGE_RESTORE_NOTIFY:-1}" != "0" ]] && command -v osascript >/dev/null 2>&1; then
+  osascript -e 'display notification "cbridge 복원이 완료되었습니다." with title "cbridge"' >/dev/null 2>&1 || true
+fi

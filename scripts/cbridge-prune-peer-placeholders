@@ -1,0 +1,28 @@
+#!/bin/zsh
+set -euo pipefail
+
+TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+
+"$TMUX_BIN" has-session -t cbridge-peers 2>/dev/null || exit 0
+
+candidate_file="$(mktemp)"
+"$TMUX_BIN" list-panes -t cbridge-peers -a \
+  -F '#{session_name}|#{window_name}|#{pane_id}|#{@cbridge_room}|#{@cbridge_title_header}|#{@cbridge_header_for}|#{pane_current_command}' 2>/dev/null |
+  awk -F '|' '
+    $1 == "cbridge-peers" && $2 ~ /^LEADER-/ && $4 == "" && $5 != "1" && $6 == "" &&
+      ($7 == "zsh" || $7 == "bash" || $7 == "fish" || $7 == "") {
+      print $3
+    }
+  ' > "$candidate_file"
+
+cat "$candidate_file" |
+  while IFS= read -r pane; do
+    [[ -n "${pane:-}" ]] || continue
+    "$TMUX_BIN" kill-pane -t "$pane" 2>/dev/null || true
+  done
+rm -f "$candidate_file"
+
+"$TMUX_BIN" list-windows -t cbridge-peers -F '#{window_index}' 2>/dev/null |
+  while IFS= read -r window_index; do
+    "$TMUX_BIN" select-layout -t "cbridge-peers:${window_index}" even-vertical >/dev/null 2>&1 || true
+  done

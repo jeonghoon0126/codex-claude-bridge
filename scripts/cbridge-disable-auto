@@ -1,0 +1,24 @@
+#!/bin/zsh
+set -euo pipefail
+
+HOME_DIR="${HOME:-/Users/wjh}"
+DOMAIN="gui/$(id -u)"
+PANE_TITLE_PID_PATH="/tmp/cbridge-pane-title-updater.pid"
+
+disable_agent() {
+  local label="$1"
+  local plist="$HOME_DIR/Library/LaunchAgents/$label.plist"
+
+  if [[ -f "$plist" ]]; then
+    launchctl bootout "$DOMAIN" "$plist" >/dev/null 2>&1 || true
+  fi
+  launchctl disable "$DOMAIN/$label" >/dev/null 2>&1 || true
+}
+
+disable_agent com.wjh.cbridge-restore
+
+pkill -f '/Users/wjh/codex-claude-bridge/covering-bridge.ts tmux-pane-titles --watch' >/dev/null 2>&1 || true
+/opt/homebrew/bin/tmux kill-session -t cbridge-pane-title-updater >/dev/null 2>&1 || true
+rm -f "$PANE_TITLE_PID_PATH"
+
+printf 'cbridge automatic restore/title watchers disabled; snapshot autosave kept\n'

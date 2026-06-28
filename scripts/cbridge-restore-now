@@ -1,0 +1,172 @@
+#!/bin/zsh
+set -euo pipefail
+
+HOME_DIR="${HOME:-/Users/wjh}"
+BRIDGE_DIR="${CBRIDGE_DIR:-$HOME_DIR/codex-claude-bridge}"
+RESTORE_SCRIPT="$BRIDGE_DIR/scripts/cbridge-restore-latest"
+DISABLE_AUTO_SCRIPT="$BRIDGE_DIR/scripts/cbridge-disable-auto"
+BUN_BIN="${BUN_BIN:-$HOME_DIR/.bun/bin/bun}"
+RESTORE_CODEX_HOME="${CBRIDGE_CODEX_HOME:-$HOME_DIR/.codex}"
+TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+LAYOUT_SCRIPT="$BRIDGE_DIR/scripts/cbridge-tmux-layout"
+GHOSTTY_APP="${CBRIDGE_GHOSTTY_APP:-/Applications/Ghostty.app}"
+GHOSTTY_ATTACH_HELPER="${CBRIDGE_GHOSTTY_ATTACH_HELPER:-$BRIDGE_DIR/scripts/cbridge-ghostty-attach-tab}"
+GHOSTTY_ATTACH_DIR="${CBRIDGE_GHOSTTY_ATTACH_DIR:-$HOME_DIR/.codex-claude-bridge/ghostty-attach}"
+FOCUS_APP_STATE="$HOME_DIR/.codex-claude-bridge/focus-app"
+LEADERS_SESSION="${CBRIDGE_RESTORE_LEADERS_SESSION:-cbridge-leaders-main}"
+LEADER_TAB_SESSION_PREFIX="${CBRIDGE_RESTORE_LEADER_TAB_SESSION_PREFIX:-cbridge-leaders-tab}"
+LEADER_WINDOW_LAYOUT="${CBRIDGE_RESTORE_LEADER_WINDOW_LAYOUT:-4x1}"
+
+export CBRIDGE_CODEX_HOME="$RESTORE_CODEX_HOME"
+export CODEX_HOME="$RESTORE_CODEX_HOME"
+if [[ "${CBRIDGE_RESTORE_FORCE_REBUILD:-0}" == "1" ]]; then
+  export CBRIDGE_RESTORE_REFRESH_LATEST="${CBRIDGE_RESTORE_REFRESH_LATEST:-0}"
+  export CBRIDGE_RESTORE_FORCE=1
+else
+  export CBRIDGE_RESTORE_REFRESH_LATEST=auto
+  export CBRIDGE_RESTORE_FORCE="${CBRIDGE_RESTORE_FORCE:-0}"
+fi
+export CBRIDGE_RESTORE_OPEN_WINDOWS="${CBRIDGE_RESTORE_OPEN_WINDOWS:-1}"
+export CBRIDGE_RESTORE_SORT_BY_RECENCY="${CBRIDGE_RESTORE_SORT_BY_RECENCY:-1}"
+export CBRIDGE_RESTORE_APPLY_LAYOUT=1
+export CBRIDGE_CODEX_LEADER_START_DELAY="${CBRIDGE_CODEX_LEADER_START_DELAY:-1}"
+export CODEX_BRIDGE_PANE_TITLES="${CODEX_BRIDGE_PANE_TITLES:-1}"
+
+apply_saved_leader_layout() {
+  local target
+  for target in "${(@f)$(leader_window_targets)}"; do
+    CBRIDGE_LAYOUT_QUIET=1 "$LAYOUT_SCRIPT" "$LEADER_WINDOW_LAYOUT" "$target" >/dev/null 2>&1 || true
+    normalize_title_header_heights "$target"
+    "$TMUX_BIN" set-window-option -t "$target" pane-border-status off >/dev/null 2>&1 || true
+    "$TMUX_BIN" set-window-option -u -t "$target" pane-border-format >/dev/null 2>&1 || true
+    "$TMUX_BIN" set-window-option -u -t "$target" pane-border-style >/dev/null 2>&1 || true
+    "$TMUX_BIN" set-window-option -u -t "$target" pane-active-border-style >/dev/null 2>&1 || true
+    normalize_title_header_heights "$target"
+  done
+}
+
+normalize_title_header_heights() {
+  local target="$1" pane_id header_for title_header
+  "$TMUX_BIN" list-panes -t "$target" -F '#{pane_id}|#{@cbridge_header_for}|#{@cbridge_title_header}' 2>/dev/null |
+    while IFS='|' read -r pane_id header_for title_header; do
+      [[ -n "${pane_id:-}" ]] || continue
+      [[ -n "${header_for:-}" || "$title_header" == "1" ]] || continue
+      "$TMUX_BIN" resize-pane -t "$pane_id" -y 2 >/dev/null 2>&1 || true
+      "$TMUX_BIN" select-pane -t "$pane_id" -T '' >/dev/null 2>&1 || true
+    done
+}
+
+leader_windows() {
+  "$TMUX_BIN" list-windows -t "$LEADERS_SESSION" -F '#{window_name}' 2>/dev/null || true
+}
+
+leader_window_targets() {
+  local window
+  while IFS= read -r window; do
+    [[ -n "$window" ]] || continue
+    printf '%s:%s\n' "$LEADERS_SESSION" "$window"
+  done < <(leader_windows)
+}
+
+leader_window_sizes() {
+  local target
+  for target in "${(@f)$(leader_window_targets)}"; do
+    printf '%s=%s\n' "$target" "$("$TMUX_BIN" display-message -p -t "$target" '#{window_width}x#{window_height}' 2>/dev/null || true)"
+  done
+}
+
+title_headers_not_two_count() {
+  local target count target_count
+  count=0
+  for target in "${(@f)$(leader_window_targets)}"; do
+    target_count="$("$TMUX_BIN" list-panes -t "$target" -F '#{@cbridge_title_header}|#{pane_height}' 2>/dev/null |
+      awk -F'|' '$1=="1" && $2!="2" {n++} END {print n+0}')"
+    count=$(( count + target_count ))
+  done
+  printf '%s\n' "$count"
+}
+
+stabilize_saved_leader_layout() {
+  local attempt current_sizes previous_sizes bad_count
+  previous_sizes=""
+  for attempt in {1..8}; do
+    apply_saved_leader_layout
+    sleep "${CBRIDGE_RESTORE_LAYOUT_STABILIZE_INTERVAL:-0.6}"
+    current_sizes="$(leader_window_sizes)"
+    bad_count="$(title_headers_not_two_count)"
+    if [[ "$bad_count" == "0" && "$current_sizes" == "$previous_sizes" ]]; then
+      apply_saved_leader_layout
+      return 0
+    fi
+    previous_sizes="$current_sizes"
+  done
+  apply_saved_leader_layout
+}
+
+leader_tab_attached() {
+  local tab_session="$1"
+  "$TMUX_BIN" list-clients -F '#{session_name}' 2>/dev/null | grep -Fqx "$tab_session"
+}
+
+ghostty_attach_cmd() {
+  local window="$1" attach_path
+  attach_path="$GHOSTTY_ATTACH_DIR/cbridge-ghostty-attach-$window"
+  mkdir -p "$GHOSTTY_ATTACH_DIR"
+  chmod +x "$GHOSTTY_ATTACH_HELPER" 2>/dev/null || true
+  ln -sf "$GHOSTTY_ATTACH_HELPER" "$attach_path"
+  print -r -- "$attach_path"
+}
+
+ensure_ghostty_tabs_attached() {
+  [[ "$CBRIDGE_RESTORE_OPEN_WINDOWS" == "1" && -d "$GHOSTTY_APP" ]] || return 0
+  mkdir -p "${FOCUS_APP_STATE:h}"
+  printf 'Ghostty\n' > "$FOCUS_APP_STATE"
+  typeset -a windows tab_args
+  windows=("${(@f)$(leader_windows)}")
+  (( ${#windows[@]} > 0 )) || return 0
+
+  local window tab_session all_attached=1
+  for window in "${windows[@]}"; do
+    tab_session="$LEADER_TAB_SESSION_PREFIX-$window"
+    leader_tab_attached "$tab_session" || all_attached=0
+    "$TMUX_BIN" has-session -t "$tab_session" 2>/dev/null || return 0
+    tab_args+=("cbridge $window" "$(ghostty_attach_cmd "$window")")
+  done
+  (( all_attached )) && return 0
+
+  /usr/bin/osascript - "$HOME_DIR" "${tab_args[@]}" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  set workDir to item 1 of argv
+  tell application "Ghostty"
+    activate
+    set firstTitle to item 2 of argv
+    set firstCommand to item 3 of argv
+    set firstConfig to new surface configuration from {initial working directory:workDir, command:firstCommand}
+    set leaderWindow to new window with configuration firstConfig
+    perform action ("set_tab_title:" & firstTitle) on focused terminal of selected tab of leaderWindow
+    delay 0.35
+    repeat with i from 4 to count argv by 2
+      set tabTitle to item i of argv
+      set tabCommand to item (i + 1) of argv
+      set cfg to new surface configuration from {initial working directory:workDir, command:tabCommand}
+      set newTab to new tab in leaderWindow with configuration cfg
+      perform action ("set_tab_title:" & tabTitle) on focused terminal of newTab
+      delay 0.35
+    end repeat
+    perform action "goto_tab:1" on focused terminal of selected tab of leaderWindow
+    activate window leaderWindow
+  end tell
+end run
+APPLESCRIPT
+}
+
+"$DISABLE_AUTO_SCRIPT" >/dev/null 2>&1 || true
+"$RESTORE_SCRIPT"
+"$DISABLE_AUTO_SCRIPT" >/dev/null 2>&1 || true
+apply_saved_leader_layout
+"$DISABLE_AUTO_SCRIPT" >/dev/null 2>&1 || true
+apply_saved_leader_layout
+ensure_ghostty_tabs_attached
+stabilize_saved_leader_layout
+
+printf 'cbridge leader tabs restored from saved layout\n'

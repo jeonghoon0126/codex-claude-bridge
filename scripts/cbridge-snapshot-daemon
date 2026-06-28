@@ -1,0 +1,51 @@
+#!/bin/zsh
+set -euo pipefail
+
+HOME_DIR="${HOME:-/Users/wjh}"
+BRIDGE_DIR="${CBRIDGE_DIR:-$HOME_DIR/codex-claude-bridge}"
+RESTORE_SCRIPT="${CBRIDGE_RESTORE_SCRIPT:-$BRIDGE_DIR/scripts/cbridge-restore-latest}"
+CODEX_HOME_DIR="${CBRIDGE_CODEX_HOME:-${CODEX_HOME:-$HOME_DIR/.codex}}"
+LOG_DIR="$HOME_DIR/.codex-claude-bridge/logs"
+LOG_FILE="$LOG_DIR/snapshot-daemon.log"
+INTERVAL="${CBRIDGE_SNAPSHOT_INTERVAL_SECONDS:-15}"
+FINAL_WAIT="${CBRIDGE_SNAPSHOT_FINAL_WAIT_SECONDS:-10}"
+
+[[ "$INTERVAL" == <-> ]] || INTERVAL=15
+(( INTERVAL >= 1 )) || INTERVAL=1
+[[ "$FINAL_WAIT" == <-> ]] || FINAL_WAIT=10
+
+mkdir -p "$LOG_DIR"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+}
+
+run_snapshot() {
+  local mode="$1" wait_seconds="$2" sync_snapshot="$3" capture_panes="$4"
+  CBRIDGE_CODEX_HOME="$CODEX_HOME_DIR" \
+  CODEX_HOME="$CODEX_HOME_DIR" \
+  CBRIDGE_RESTORE_LOCK_WAIT_SECONDS="$wait_seconds" \
+  CBRIDGE_SNAPSHOT_SYNC="$sync_snapshot" \
+  CBRIDGE_CAPTURE_PANES="$capture_panes" \
+  CBRIDGE_SNAPSHOT_QUIET_UNCHANGED=1 \
+    "$RESTORE_SCRIPT" "$mode" >/dev/null 2>>"$LOG_FILE" || log "snapshot command failed: $mode"
+}
+
+finish() {
+  trap - INT TERM HUP
+  log "snapshot daemon stopping; saving final cbridge snapshot"
+  run_snapshot "--snapshot-final" "$FINAL_WAIT" 1 1
+  log "snapshot daemon stopped"
+  exit 0
+}
+
+trap finish INT TERM HUP
+
+log "snapshot daemon started; interval=${INTERVAL}s final_wait=${FINAL_WAIT}s"
+run_snapshot "--snapshot" 0 0 0
+
+while :; do
+  sleep "$INTERVAL" &
+  wait "$!" 2>/dev/null || true
+  run_snapshot "--snapshot" 0 0 0
+done

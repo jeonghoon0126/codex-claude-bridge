@@ -6,24 +6,130 @@ BRIDGE_DIR="${CBRIDGE_DIR:-$HOME_DIR/codex-claude-bridge}"
 TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
 BUN_BIN="${BUN_BIN:-$HOME_DIR/.bun/bin/bun}"
 CODEX_BIN="${CODEX_BIN:-$HOME_DIR/.local/bin/codex}"
+CODEX_HOME_DIR="${CBRIDGE_CODEX_HOME:-$HOME_DIR/.codex}"
+export CBRIDGE_CODEX_HOME="$CODEX_HOME_DIR"
+export CODEX_HOME="$CODEX_HOME_DIR"
+SQLITE_BIN="${SQLITE_BIN:-/usr/bin/sqlite3}"
+CODEX_STATE_DB="${CBRIDGE_CODEX_STATE_DB:-$CODEX_HOME_DIR/state_5.sqlite}"
 CURL_BIN="${CURL_BIN:-/usr/bin/curl}"
 OPEN_BIN="${OPEN_BIN:-/usr/bin/open}"
+LAYOUT_SCRIPT="${CBRIDGE_LAYOUT_SCRIPT:-$BRIDGE_DIR/scripts/cbridge-tmux-layout}"
 CONFIG="${CBRIDGE_RESTORE_CONFIG:-$HOME_DIR/.codex-claude-bridge/restore-rooms.tsv}"
 BRIDGE_URL="${CODEX_BRIDGE_URL:-http://localhost:8788}"
 LOG_DIR="$HOME_DIR/.codex-claude-bridge/logs"
+LOCK_DIR="${CBRIDGE_RESTORE_LOCK_DIR:-$HOME_DIR/.codex-claude-bridge/restore.lock}"
+LOCK_STALE_SECONDS="${CBRIDGE_RESTORE_LOCK_STALE_SECONDS:-1800}"
 OPEN_WINDOWS="${CBRIDGE_RESTORE_OPEN_WINDOWS:-1}"
 FORCE="${CBRIDGE_RESTORE_FORCE:-0}"
 MODE="${1:-restore}"
+LOCK_WAIT_SECONDS="${CBRIDGE_RESTORE_LOCK_WAIT_SECONDS:-0}"
+SNAPSHOT_SYNC="${CBRIDGE_SNAPSHOT_SYNC:-0}"
+SNAPSHOT_QUIET_UNCHANGED="${CBRIDGE_SNAPSHOT_QUIET_UNCHANGED:-0}"
+CAPTURE_PANES="${CBRIDGE_CAPTURE_PANES:-0}"
+PANE_CAPTURE_DIR="${CBRIDGE_PANE_CAPTURE_DIR:-$HOME_DIR/.codex-claude-bridge/pane-captures}"
+if [[ "$MODE" == "--snapshot-final" || "$MODE" == "snapshot-final" ]]; then
+  LOCK_WAIT_SECONDS="${CBRIDGE_RESTORE_LOCK_WAIT_SECONDS:-10}"
+  SNAPSHOT_SYNC="${CBRIDGE_SNAPSHOT_SYNC:-1}"
+  CAPTURE_PANES="${CBRIDGE_CAPTURE_PANES:-1}"
+fi
 RESTORE_WIDTH="${CBRIDGE_RESTORE_WIDTH:-300}"
 RESTORE_HEIGHT="${CBRIDGE_RESTORE_HEIGHT:-50}"
+APPLY_LAYOUT="${CBRIDGE_RESTORE_APPLY_LAYOUT:-1}"
 LEADERS_SESSION="${CBRIDGE_RESTORE_LEADERS_SESSION:-cbridge-leaders-main}"
 LEADER_TAB_SESSION_PREFIX="${CBRIDGE_RESTORE_LEADER_TAB_SESSION_PREFIX:-cbridge-leaders-tab}"
 GHOSTTY_APP="${CBRIDGE_GHOSTTY_APP:-/Applications/Ghostty.app}"
 GHOSTTY_TAB_DELAY="${CBRIDGE_GHOSTTY_TAB_DELAY:-0.35}"
+CODEX_LEADER_START_DELAY="${CBRIDGE_CODEX_LEADER_START_DELAY:-8}"
+GHOSTTY_ATTACH_HELPER="${CBRIDGE_GHOSTTY_ATTACH_HELPER:-$BRIDGE_DIR/scripts/cbridge-ghostty-attach-tab}"
+GHOSTTY_ATTACH_DIR="${CBRIDGE_GHOSTTY_ATTACH_DIR:-$HOME_DIR/.codex-claude-bridge/ghostty-attach}"
+SORT_BY_RECENCY="${CBRIDGE_RESTORE_SORT_BY_RECENCY:-0}"
+REFRESH_LATEST="${CBRIDGE_RESTORE_REFRESH_LATEST:-auto}"
+LATEST_LIMIT="${CBRIDGE_RESTORE_LATEST_LIMIT:-16}"
+LEADERS_PER_WINDOW="${CBRIDGE_RESTORE_LEADERS_PER_WINDOW:-4}"
+LEADER_WINDOW_LAYOUT="${CBRIDGE_RESTORE_LEADER_WINDOW_LAYOUT:-4x1}"
+LATEST_SCAN_LIMIT="${CBRIDGE_RESTORE_LATEST_SCAN_LIMIT:-100}"
+LATEST_ORDER="${CBRIDGE_RESTORE_LATEST_ORDER:-created}"
+RESTORE_CWD="${CBRIDGE_RESTORE_CWD:-$HOME_DIR}"
+
+"$TMUX_BIN" set-option -gq default-size "${RESTORE_WIDTH}x${RESTORE_HEIGHT}" 2>/dev/null || true
 
 mkdir -p "$LOG_DIR"
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_DIR/restore.log" }
 quote() { printf "%q" "$1" }
+
+lock_pid_alive() {
+  local pid="$1"
+  [[ -n "$pid" && "$pid" == <-> ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+restore_lock_active() {
+  [[ -d "$LOCK_DIR" ]] || return 1
+
+  local now started pid
+  now="$(date '+%s')"
+  started="$(cat "$LOCK_DIR/started" 2>/dev/null || true)"
+  if [[ -n "$started" && "$started" == <-> && $(( now - started )) -gt "$LOCK_STALE_SECONDS" ]]; then
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    return 1
+  fi
+
+  pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ "$pid" == "$$" ]]; then
+    return 1
+  fi
+  if lock_pid_alive "$pid"; then
+    return 0
+  fi
+
+  rm -rf "$LOCK_DIR" 2>/dev/null || true
+  return 1
+}
+
+acquire_restore_lock() {
+  local waited=0 wait_limit="$LOCK_WAIT_SECONDS"
+  [[ "$wait_limit" == <-> ]] || wait_limit=0
+
+  while :; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$LOCK_DIR/pid"
+      date '+%s' > "$LOCK_DIR/started"
+      printf '%s\n' "$MODE" > "$LOCK_DIR/mode"
+      return 0
+    fi
+
+    if restore_lock_active; then
+      if (( waited < wait_limit )); then
+        sleep 1
+        waited=$(( waited + 1 ))
+        continue
+      fi
+      log "operation skipped; another cbridge restore/snapshot is in progress"
+      exit 0
+    fi
+    break
+  done
+
+  mkdir "$LOCK_DIR" 2>/dev/null || {
+    log "operation skipped; could not acquire cbridge restore/snapshot lock"
+    exit 0
+  }
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+  date '+%s' > "$LOCK_DIR/started"
+  printf '%s\n' "$MODE" > "$LOCK_DIR/mode"
+}
+
+release_restore_lock() {
+  local pid
+  pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  [[ "$pid" == "$$" ]] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+}
+
+handle_termination() {
+  log "operation interrupted by signal"
+  release_restore_lock
+  exit 143
+}
 
 require_file() {
   if [[ ! -e "$1" ]]; then
@@ -36,14 +142,240 @@ require_file "$CONFIG"
 require_file "$BRIDGE_DIR/bridge-server.ts"
 require_file "$BRIDGE_DIR/bridge-codex-peer"
 require_file "$BRIDGE_DIR/covering-bridge.ts"
+require_file "$LAYOUT_SCRIPT"
+require_file "$BRIDGE_DIR/scripts/cbridge-compose"
+require_file "$GHOSTTY_ATTACH_HELPER"
+
+validate_snapshot_candidate() {
+  local candidate="$1"
+  awk -F '\t' '
+    FNR == NR {
+      if ($0 !~ /^#/ && NF >= 4) {
+        expected_room[$1] = 1
+        expected_rows++
+      }
+      next
+    }
+    $0 !~ /^#/ && NF >= 4 {
+      actual_room[$1] = 1
+      actual_rows++
+      if (seen_room[$1]++) {
+        duplicate_room = $1
+      }
+      if (seen_thread[$2]++) {
+        duplicate_thread = $2
+      }
+    }
+    END {
+      if (actual_rows == 0) {
+        print "candidate snapshot has no restorable leader rows"
+        exit 1
+      }
+      if (duplicate_room != "") {
+        print "candidate snapshot has duplicate room " duplicate_room
+        exit 1
+      }
+      if (duplicate_thread != "") {
+        print "candidate snapshot has duplicate thread " duplicate_thread
+        exit 1
+      }
+      if (expected_rows > 0 && actual_rows < expected_rows) {
+        print "candidate snapshot shrank from " expected_rows " rows to " actual_rows
+        exit 1
+      }
+      for (room in expected_room) {
+        if (!(room in actual_room)) {
+          print "candidate snapshot is missing pane for " room
+          exit 1
+        }
+      }
+    }
+  ' "$CONFIG" "$candidate"
+}
+
+sort_snapshot_by_recency() {
+  local source="$1" destination="$2"
+  if [[ "$SORT_BY_RECENCY" == "0" || ! -r "$CODEX_STATE_DB" || ! -x "$SQLITE_BIN" ]]; then
+    cp "$source" "$destination"
+    return
+  fi
+
+  local updated_file ranked_file
+  updated_file="$(mktemp)"
+  ranked_file="$(mktemp)"
+  if ! "$SQLITE_BIN" "$CODEX_STATE_DB" "select id || char(9) || updated_at from threads;" > "$updated_file" 2>/dev/null; then
+    rm -f "$updated_file" "$ranked_file"
+    cp "$source" "$destination"
+    return
+  fi
+
+  head -n 1 "$source" > "$destination"
+  awk -F '\t' -v OFS='\t' '
+    FNR == NR {
+      updated[$1] = $2
+      next
+    }
+    $0 !~ /^#/ && NF >= 8 {
+      rec = (($2 in updated) ? updated[$2] : 0)
+      printf "%s\t%020.0f\t%08d", $4, 999999999999999 - rec, FNR
+      for (i = 1; i <= NF; i++) {
+        printf "\t%s", $i
+      }
+      printf "\n"
+    }
+  ' "$updated_file" "$source" |
+    sort -t $'\t' -k1,1 -k2,2n -k3,3n > "$ranked_file"
+
+  awk -F '\t' -v OFS='\t' '
+    {
+      group = $1
+      if (group != current_group) {
+        current_group = group
+        pane_index = 0
+      }
+      sidecar_created = pane_index >= 4 ? "1" : ""
+      sidecar_position = pane_index >= 4 ? ($13 != "" ? $13 : "right") : ""
+      print $4, $5, $6, $7, $8, pane_index, $10, $11, sidecar_created, sidecar_position
+      pane_index++
+    }
+  ' "$ranked_file" >> "$destination"
+
+  rm -f "$updated_file" "$ranked_file"
+}
+
+leader_tab_clients_attached() {
+  "$TMUX_BIN" list-clients -F '#{session_name}' 2>/dev/null | grep -q "^$LEADER_TAB_SESSION_PREFIX-"
+}
+
+config_has_restorable_rows() {
+  awk -F '\t' '
+    $0 !~ /^#/ && NF >= 4 {
+      found = 1
+      exit
+    }
+    END {
+      exit found ? 0 : 1
+    }
+  ' "$CONFIG" 2>/dev/null
+}
+
+should_refresh_latest_config() {
+  case "$REFRESH_LATEST" in
+    0|false|no) return 1 ;;
+    1|true|yes) return 0 ;;
+  esac
+
+  config_has_restorable_rows && return 1
+  ! leader_tab_clients_attached && return 0
+  "$TMUX_BIN" has-session -t "$LEADERS_SESSION" 2>/dev/null && return 1
+  "$TMUX_BIN" list-sessions -F '#{session_name}' 2>/dev/null | grep -Eq '^cbridge-leaders-[A-Z]$' && return 1
+  return 0
+}
+
+if [[ "${CBRIDGE_RESTORE_PRINT_REFRESH_DECISION:-0}" == "1" ]]; then
+  if should_refresh_latest_config; then
+    print -r -- refresh
+  else
+    print -r -- preserve
+  fi
+  exit 0
+fi
+
+refresh_config_from_latest_threads() {
+  [[ -r "$CODEX_STATE_DB" && -x "$SQLITE_BIN" ]] || return 1
+
+  local tmp rows backup_dir backup restore_cwd_sql candidates ranked seq id cwd rollout_path updated_ts created_ts selected_ts activity_ts latest_order_sql latest_tiebreaker_sql
+  restore_cwd_sql="${RESTORE_CWD//\'/\'\'}"
+  tmp="$(mktemp "$CONFIG.latest.XXXXXX")"
+  candidates="$(mktemp "$CONFIG.candidates.XXXXXX")"
+  ranked="$(mktemp "$CONFIG.ranked.XXXXXX")"
+  printf '# room\tthread_id\tcwd\tleader_group\twindow_index\tpane_index\twindow_active\tpane_active\tsidecar_created\tsidecar_position\n' > "$tmp"
+
+  case "$LATEST_ORDER" in
+    updated|updated_at|activity)
+      latest_order_sql="updated_at"
+      latest_tiebreaker_sql="created_at"
+      ;;
+    created|created_at|"")
+      latest_order_sql="created_at"
+      latest_tiebreaker_sql="updated_at"
+      ;;
+    *)
+      log "invalid CBRIDGE_RESTORE_LATEST_ORDER=$LATEST_ORDER; using created"
+      latest_order_sql="created_at"
+      latest_tiebreaker_sql="updated_at"
+      ;;
+  esac
+
+  if ! "$SQLITE_BIN" -noheader -separator $'\t' "$CODEX_STATE_DB" \
+    "select id,cwd,rollout_path,strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch'),strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch'),strftime('%Y-%m-%dT%H:%M:%SZ', $latest_order_sql, 'unixepoch') from threads where archived=0 and source='cli' and coalesce(thread_source,'user')='user' and cwd='$restore_cwd_sql' and first_user_message not like 'You are the responder in a Codex-Codex Bridge room:%' order by $latest_order_sql desc, $latest_tiebreaker_sql desc limit $LATEST_SCAN_LIMIT;" > "$candidates"; then
+    rm -f "$tmp" "$candidates" "$ranked"
+    return 1
+  fi
+
+  seq=0
+  while IFS=$'\t' read -r id cwd rollout_path updated_ts created_ts selected_ts; do
+    [[ -n "${id:-}" ]] || continue
+    seq=$(( seq + 1 ))
+    activity_ts="$selected_ts"
+    [[ -n "$activity_ts" ]] || activity_ts="$created_ts"
+    [[ -n "$activity_ts" ]] || activity_ts="$updated_ts"
+    printf '%s\t%08d\t%s\t%s\n' "$activity_ts" "$seq" "$id" "$cwd" >> "$ranked"
+  done < "$candidates"
+
+  if ! sort -t $'\t' -k1,1r -k2,2n "$ranked" | head -n "$LATEST_LIMIT" |
+    awk -F '\t' -v OFS='\t' -v per_window="$LEADERS_PER_WINDOW" '
+      {
+        idx = NR - 1
+        if (per_window <= 0) per_window = 4
+        group_index = int(idx / per_window)
+        group = substr("ABCDEFGHIJKLMNOPQRSTUVWXYZ", group_index + 1, 1)
+        if (group == "") group = "W" group_index
+        pane = idx % per_window
+        print "LEADER-" NR, $3, $4, "cbridge-leaders-main:" group, group_index, pane, (group_index == 0 ? 1 : 0), (NR == 1 ? 1 : 0), "", ""
+      }
+    ' >> "$tmp"; then
+    rm -f "$tmp" "$candidates" "$ranked"
+    return 1
+  fi
+  rm -f "$candidates" "$ranked"
+
+  rows="$(awk 'BEGIN { n = 0 } $0 !~ /^#/ && NF { n++ } END { print n }' "$tmp")"
+  if [[ -z "$rows" || "$rows" == "0" ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if [[ -f "$CONFIG" ]] && cmp -s "$tmp" "$CONFIG"; then
+    rm -f "$tmp"
+    log "latest restore config unchanged"
+    return 0
+  fi
+
+  if [[ -f "$CONFIG" ]]; then
+    backup_dir="${CONFIG:h}/restore-backups"
+    mkdir -p "$backup_dir"
+    backup="$backup_dir/restore-rooms.before-latest-refresh.$(date '+%Y%m%d%H%M%S').tsv"
+    cp -p "$CONFIG" "$backup" 2>/dev/null || true
+    ls -t "$backup_dir"/restore-rooms.*.tsv 2>/dev/null | sed -n '21,$p' | xargs rm -f 2>/dev/null || true
+  fi
+
+  mv "$tmp" "$CONFIG"
+  log "latest restore config refreshed from $CODEX_STATE_DB ($rows rows)"
+}
 
 snapshot_current() {
+  if restore_lock_active; then
+    log "snapshot skipped; restore in progress"
+    return
+  fi
+
   local tmp
   tmp="$(mktemp "$CONFIG.tmp.XXXXXX")"
-  printf '# room\tthread_id\tcwd\tleader_group\twindow_index\tpane_index\twindow_active\tpane_active\n' > "$tmp"
+  printf '# room\tthread_id\tcwd\tleader_group\twindow_index\tpane_index\twindow_active\tpane_active\tsidecar_created\tsidecar_position\n' > "$tmp"
 
-  "$TMUX_BIN" list-panes -a -F '#{session_name}|#{window_index}|#{window_name}|#{window_active}|#{pane_index}|#{pane_active}|#{pane_pid}|#{pane_current_path}|#{@cbridge_room}|#{@cbridge_thread_id}' 2>/dev/null |
-    while IFS='|' read -r session window_index window window_active pane_index pane_active pid cwd room thread; do
+  "$TMUX_BIN" list-panes -a -F '#{session_name}|#{window_index}|#{window_name}|#{window_active}|#{pane_index}|#{pane_active}|#{pane_pid}|#{pane_current_path}|#{@cbridge_room}|#{@cbridge_thread_id}|#{@cbridge_sidecar_created}|#{@cbridge_sidecar_position}|#{@cbridge_restore_order}' 2>/dev/null |
+    while IFS='|' read -r session window_index window window_active pane_index pane_active pid cwd room thread sidecar_created sidecar_position restore_order; do
       [[ "$session" == cbridge-leaders-* ]] || continue
       [[ "$session" == "$LEADER_TAB_SESSION_PREFIX"-* ]] && continue
       [[ -n "${room:-}" ]] || continue
@@ -51,18 +383,29 @@ snapshot_current() {
         thread="$(ps -o args= -p "$pid" 2>/dev/null | sed -nE 's/.* resume ([0-9a-fA-F-]{36}).*/\1/p' | head -n 1)"
       fi
       [[ -n "${thread:-}" ]] || continue
+      if [[ -n "${restore_order:-}" && "$restore_order" == <-> ]]; then
+        pane_index="$(( restore_order - 1 ))"
+      fi
       if [[ "$session" == "$LEADERS_SESSION" ]]; then
-        printf '%s\t%s\t%s\t%s:%s\t%s\t%s\t%s\t%s\n' "$room" "$thread" "$cwd" "$session" "$window" "$window_index" "$pane_index" "$window_active" "$pane_active" >> "$tmp"
+        printf '%s\t%s\t%s\t%s:%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$room" "$thread" "$cwd" "$session" "$window" "$window_index" "$pane_index" "$window_active" "$pane_active" "${sidecar_created:-}" "${sidecar_position:-}" >> "$tmp"
       else
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$room" "$thread" "$cwd" "$session" "$window_index" "$pane_index" "$window_active" "$pane_active" >> "$tmp"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$room" "$thread" "$cwd" "$session" "$window_index" "$pane_index" "$window_active" "$pane_active" "${sidecar_created:-}" "${sidecar_position:-}" >> "$tmp"
       fi
     done
 
   if [[ "$(wc -l < "$tmp" | tr -d ' ')" -gt 1 ]]; then
+    local validation_error
+    if ! validation_error="$(validate_snapshot_candidate "$tmp" 2>&1)"; then
+      rm -f "$tmp"
+      log "snapshot skipped; $validation_error"
+      return
+    fi
     if [[ -f "$CONFIG" ]] && cmp -s "$tmp" "$CONFIG"; then
       rm -f "$tmp"
-      log "snapshot unchanged"
-      return
+      if [[ "$SNAPSHOT_QUIET_UNCHANGED" != "1" ]]; then
+        log "snapshot unchanged"
+      fi
+      return 0
     fi
     if [[ -f "$CONFIG" ]]; then
       local backup_dir backup
@@ -80,9 +423,71 @@ snapshot_current() {
   fi
 }
 
-if [[ "$MODE" == "--snapshot" || "$MODE" == "snapshot" ]]; then
+capture_leader_panes() {
+  if [[ "$CAPTURE_PANES" != "1" ]]; then
+    return 0
+  fi
+
+  local capture_root capture_dir latest_link pane_id session window_index window pane_index room thread safe_room file
+  capture_root="$PANE_CAPTURE_DIR"
+  capture_dir="$capture_root/$(date '+%Y%m%d%H%M%S')"
+  mkdir -p "$capture_dir"
+
+  "$TMUX_BIN" list-panes -a -F '#{pane_id}|#{session_name}|#{window_index}|#{window_name}|#{pane_index}|#{@cbridge_room}|#{@cbridge_thread_id}' 2>/dev/null |
+    while IFS='|' read -r pane_id session window_index window pane_index room thread; do
+      [[ "$session" == cbridge-leaders-* ]] || continue
+      [[ "$session" == "$LEADER_TAB_SESSION_PREFIX"-* ]] && continue
+      [[ -n "${room:-}" ]] || continue
+      safe_room="${room//[^A-Za-z0-9_.-]/_}"
+      file="$capture_dir/${safe_room}.txt"
+      {
+        printf 'captured_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf 'room=%s\nthread_id=%s\nsession=%s\nwindow=%s\npane_index=%s\npane_id=%s\n\n' "$room" "${thread:-}" "$session:$window_index:$window" "$window" "$pane_index" "$pane_id"
+        "$TMUX_BIN" capture-pane -p -S - -t "$pane_id" 2>/dev/null || true
+      } > "$file"
+    done
+
+  latest_link="$capture_root/latest"
+  if [[ ! -e "$latest_link" || -L "$latest_link" ]]; then
+    ln -sfn "$capture_dir" "$latest_link" 2>/dev/null || true
+  fi
+  log "pane capture saved to $capture_dir"
+}
+
+flush_snapshot_files() {
+  if [[ "$SNAPSHOT_SYNC" != "1" ]]; then
+    return 0
+  fi
+  /bin/sync 2>/dev/null || true
+  log "snapshot flushed to disk"
+}
+
+if [[ "$MODE" == "--snapshot" || "$MODE" == "snapshot" || "$MODE" == "--snapshot-final" || "$MODE" == "snapshot-final" ]]; then
+  acquire_restore_lock
+  trap release_restore_lock EXIT
+  trap handle_termination INT TERM HUP
   snapshot_current
+  capture_leader_panes
+  flush_snapshot_files
   exit 0
+fi
+
+acquire_restore_lock
+trap release_restore_lock EXIT
+trap handle_termination INT TERM HUP
+
+REFRESHED_FOR_RESTORE=0
+if should_refresh_latest_config; then
+  refresh_config_from_latest_threads || log "latest restore config refresh skipped"
+  REFRESHED_FOR_RESTORE=1
+fi
+
+if [[ "${CBRIDGE_RESTORE_ALLOW_UNATTACHED_REBUILD:-0}" == "1" &&
+   "$FORCE" != "1" && "$REFRESHED_FOR_RESTORE" == "1" ]] &&
+   "$TMUX_BIN" has-session -t "$LEADERS_SESSION" 2>/dev/null &&
+   ! leader_tab_clients_attached; then
+  FORCE=1
+  log "forcing leader rebuild; no attached Ghostty leader clients"
 fi
 
 ensure_bridge_server() {
@@ -110,8 +515,14 @@ post_room() {
 leader_cmd() {
   local room="$1" thread="$2" cwd="$3"
   local cfg="mcp_servers.codex-bridge.env.CODEX_BRIDGE_ROOM=\"$room\""
-  printf 'cd %s && printf "%%s" %s > /tmp/codex-bridge-room-$$; printf "\033]0;%s\007"; export CODEX_BRIDGE_ROOM=%s CODEX_BRIDGE_CWD=%s CODEX_BRIDGE_URL=%s; %s resume %s -c %s --model gpt-5.5 -c model_reasoning_effort="xhigh" --sandbox danger-full-access -a never --no-alt-screen' \
-    "$(quote "$cwd")" "$(quote "$room")" "$room" "$(quote "$room")" "$(quote "$cwd")" "$(quote "$BRIDGE_URL")" "$(quote "$CODEX_BIN")" "$(quote "$thread")" "$(quote "$cfg")"
+  printf 'cd %s && printf "%%s" %s > /tmp/codex-bridge-room-$$; printf "\033]0;%s\007"; export CODEX_HOME=%s CODEX_BRIDGE_ROOM=%s CODEX_BRIDGE_CWD=%s CODEX_BRIDGE_URL=%s; %s resume %s --disable apps --disable plugins -c check_for_update_on_startup=false -c mcp_servers.coveringWiki.enabled=false -c mcp_servers.figma.enabled=false -c mcp_servers.openaiDeveloperDocs.enabled=false -c %s --model gpt-5.5 -c model_reasoning_effort="xhigh" --sandbox danger-full-access -a never --no-alt-screen' \
+    "$(quote "$cwd")" "$(quote "$room")" "$room" "$(quote "$CODEX_HOME_DIR")" "$(quote "$room")" "$(quote "$cwd")" "$(quote "$BRIDGE_URL")" "$(quote "$CODEX_BIN")" "$(quote "$thread")" "$(quote "$cfg")"
+}
+
+pause_after_leader_start() {
+  if [[ "$CODEX_LEADER_START_DELAY" != "0" ]]; then
+    sleep "$CODEX_LEADER_START_DELAY"
+  fi
 }
 
 peer_cmd() {
@@ -120,8 +531,8 @@ peer_cmd() {
     "$(quote "$cwd")" "$(quote "$room")" "$(quote "$cwd")" "$(quote "$cwd")" "$(quote "$BRIDGE_URL")" "$(quote "$BRIDGE_DIR/bridge-codex-peer")" "$(quote "$room")"
 }
 
-typeset -a rooms threads cwds room_groups window_indices pane_indices window_actives pane_actives
-while IFS=$'\t' read -r room thread cwd group window_index pane_index window_active pane_active rest; do
+typeset -a rooms threads cwds room_groups window_indices pane_indices window_actives pane_actives sidecar_createds sidecar_positions
+while IFS=$'\t' read -r room thread cwd group window_index pane_index window_active pane_active sidecar_created sidecar_position rest; do
   [[ -z "${room:-}" || "$room" == \#* ]] && continue
   rooms+=("$room")
   threads+=("$thread")
@@ -131,6 +542,8 @@ while IFS=$'\t' read -r room thread cwd group window_index pane_index window_act
   pane_indices+=("${pane_index:-}")
   window_actives+=("${window_active:-}")
   pane_actives+=("${pane_active:-}")
+  sidecar_createds+=("${sidecar_created:-}")
+  sidecar_positions+=("${sidecar_position:-}")
 done < "$CONFIG"
 
 if (( ${#rooms[@]} == 0 )); then
@@ -148,30 +561,133 @@ if [[ "$FORCE" == "1" ]]; then
       "$TMUX_BIN" kill-session -t "$tab_session" 2>/dev/null || true
     done
   "$TMUX_BIN" kill-session -t "$LEADERS_SESSION" 2>/dev/null || true
-  "$TMUX_BIN" kill-session -t cbridge-leaders-A 2>/dev/null || true
-  "$TMUX_BIN" kill-session -t cbridge-leaders-B 2>/dev/null || true
+  "$TMUX_BIN" list-sessions -F '#{session_name}' 2>/dev/null |
+    while IFS= read -r legacy_session; do
+      [[ "$legacy_session" == cbridge-leaders-[A-Z] ]] || continue
+      "$TMUX_BIN" kill-session -t "$legacy_session" 2>/dev/null || true
+    done
   "$TMUX_BIN" kill-session -t cbridge-peers 2>/dev/null || true
 fi
 
 create_peer() {
-  local room="$1" cwd="$2" cmd pane
+  local room="$1" cwd="$2" cmd pane target
   post_room "$room"
   cmd="$(peer_cmd "$room" "$cwd")"
   if ! "$TMUX_BIN" has-session -t cbridge-peers 2>/dev/null; then
     pane="$("$TMUX_BIN" new-session -d -P -F '#{pane_id}' -s cbridge-peers -n "$room" -c "$cwd" "$cmd")"
+    target="cbridge-peers:$("$TMUX_BIN" display-message -p -t "$pane" '#{window_index}' 2>/dev/null || true)"
   elif ! "$TMUX_BIN" list-windows -t cbridge-peers -F '#{window_name}' | grep -qx "$room"; then
     pane="$("$TMUX_BIN" new-window -d -P -F '#{pane_id}' -t cbridge-peers -n "$room" -c "$cwd" "$cmd")"
+    target="cbridge-peers:$("$TMUX_BIN" display-message -p -t "$pane" '#{window_index}' 2>/dev/null || true)"
   else
-    return 0
+    target="$(peer_window_target_for_room "$room" 2>/dev/null || true)"
+    [[ -n "$target" ]] || return 1
+    if peer_window_has_room_pane "$target" "$room"; then
+      prune_peer_window_placeholders "$target" "$room"
+      return 0
+    fi
+    pane="$("$TMUX_BIN" split-window -d -P -F '#{pane_id}' -t "$target" -c "$cwd" "$cmd")"
   fi
   "$TMUX_BIN" set-option -pt "$pane" @cbridge_room "$room" >/dev/null 2>&1 || true
+  [[ -n "${target:-}" ]] && prune_peer_window_placeholders "$target" "$room"
+}
+
+ensure_peer_session() {
+  if ! "$TMUX_BIN" has-session -t cbridge-peers 2>/dev/null; then
+    "$TMUX_BIN" new-session -d -s cbridge-peers >/dev/null 2>&1 || true
+  fi
+}
+
+peer_window_target_for_room() {
+  local room="$1"
+  while IFS='|' read -r window_index window_name; do
+    if [[ "$window_name" == "$room" ]]; then
+      print -r -- "cbridge-peers:${window_index}"
+      return 0
+    fi
+  done < <("$TMUX_BIN" list-windows -t cbridge-peers -F '#{window_index}|#{window_name}' 2>/dev/null || true)
+  return 1
+}
+
+peer_window_has_room_pane() {
+  local target="$1" room="$2"
+  "$TMUX_BIN" list-panes -t "$target" -F '#{@cbridge_room}' 2>/dev/null |
+    grep -Fqx -- "$room"
+}
+
+prune_peer_window_placeholders() {
+  local target="$1" room="$2" pane_count pane pane_room pane_command
+  [[ -n "$target" && -n "$room" ]] || return 0
+  peer_window_has_room_pane "$target" "$room" || return 0
+
+  pane_count="$("$TMUX_BIN" list-panes -t "$target" -F '#{pane_id}' 2>/dev/null | wc -l | tr -d ' ')"
+  [[ "$pane_count" == <-> ]] || pane_count=0
+  (( pane_count > 1 )) || return 0
+
+  while IFS='|' read -r pane pane_room title_header header_for pane_command; do
+    [[ -n "${pane:-}" ]] || continue
+    [[ -z "${pane_room:-}" ]] || continue
+    [[ "${title_header:-}" != "1" && -z "${header_for:-}" ]] || continue
+    case "$pane_command" in
+      zsh|bash|fish|"") "$TMUX_BIN" kill-pane -t "$pane" 2>/dev/null || true ;;
+    esac
+  done < <("$TMUX_BIN" list-panes -t "$target" -F '#{pane_id}|#{@cbridge_room}|#{@cbridge_title_header}|#{@cbridge_header_for}|#{pane_current_command}' 2>/dev/null || true)
+  "$TMUX_BIN" select-layout -t "$target" even-vertical >/dev/null 2>&1 || true
+}
+
+prune_all_peer_placeholders() {
+  "$TMUX_BIN" has-session -t cbridge-peers 2>/dev/null || return 0
+
+  local panes_file pane
+  panes_file="$(mktemp)"
+  "$TMUX_BIN" list-panes -t cbridge-peers -a -F '#{session_name}|#{window_name}|#{pane_id}|#{@cbridge_room}|#{@cbridge_title_header}|#{@cbridge_header_for}|#{pane_current_command}' 2>/dev/null > "$panes_file" || true
+  awk -F '|' '
+    FNR == NR {
+      if ($1 == "cbridge-peers" && $2 ~ /^LEADER-/ && $4 == $2) {
+        has_room[$2] = 1
+      }
+      next
+    }
+    $1 == "cbridge-peers" && $2 ~ /^LEADER-/ && has_room[$2] && $4 == "" && $5 != "1" && $6 == "" &&
+      ($7 == "zsh" || $7 == "bash" || $7 == "fish" || $7 == "") {
+      print $3
+    }
+  ' "$panes_file" "$panes_file" |
+    while IFS= read -r pane; do
+      [[ -n "${pane:-}" ]] || continue
+      "$TMUX_BIN" kill-pane -t "$pane" 2>/dev/null || true
+    done
+  rm -f "$panes_file"
+  "$TMUX_BIN" list-windows -t cbridge-peers -F '#{window_index}' 2>/dev/null |
+    while IFS= read -r window_index; do
+      "$TMUX_BIN" select-layout -t "cbridge-peers:${window_index}" even-vertical >/dev/null 2>&1 || true
+    done
+}
+
+park_leader_pane_in_peer_window() {
+  local pane="$1" room="$2" cwd="$3"
+  [[ -n "$pane" && -n "$room" ]] || return 1
+  [[ -n "$cwd" && -d "$cwd" ]] || cwd="$RESTORE_CWD"
+
+  ensure_peer_session
+  local dest placeholder window_index
+  dest="$(peer_window_target_for_room "$room" 2>/dev/null || true)"
+  if [[ -z "$dest" ]]; then
+    placeholder="$("$TMUX_BIN" new-window -d -P -F '#{pane_id}' -t cbridge-peers -n "$room" -c "$cwd" 2>/dev/null || true)"
+    window_index="$("$TMUX_BIN" display-message -p -t "$placeholder" '#{window_index}' 2>/dev/null || true)"
+    [[ -n "$window_index" ]] && dest="cbridge-peers:${window_index}"
+  fi
+  [[ -n "$dest" ]] || return 1
+
+  "$TMUX_BIN" join-pane -d -s "$pane" -t "$dest" 2>/dev/null || return 1
+  [[ -n "${placeholder:-}" ]] && "$TMUX_BIN" kill-pane -t "$placeholder" 2>/dev/null || true
+  prune_peer_window_placeholders "$dest" "$room"
+  "$TMUX_BIN" select-layout -t "$dest" even-vertical >/dev/null 2>&1 || true
 }
 
 leader_window_for_group() {
   local group="$1"
   case "$group" in
-    cbridge-leaders-A|A|"$LEADERS_SESSION:A") print -r -- A ;;
-    cbridge-leaders-B|B|"$LEADERS_SESSION:B") print -r -- B ;;
     "$LEADERS_SESSION":*) print -r -- "${group#*:}" ;;
     cbridge-leaders-*) print -r -- "${group#cbridge-leaders-}" ;;
     "") print -r -- A ;;
@@ -179,19 +695,310 @@ leader_window_for_group() {
   esac
 }
 
+expected_rooms_for_leader_window() {
+  local window="$1" i
+  for (( i=1; i<=${#rooms[@]}; i++ )); do
+    if [[ "$(leader_window_for_group "${room_groups[$i]}")" == "$window" ]]; then
+      print -r -- "${rooms[$i]}"
+    fi
+  done
+}
+
+leader_indexes_for_window() {
+  local window="$1" indexes_file i
+  indexes_file="$(mktemp)"
+  for (( i=1; i<=${#rooms[@]}; i++ )); do
+    if [[ "$(leader_window_for_group "${room_groups[$i]}")" == "$window" ]]; then
+      printf '%08d\t%08d\t%s\n' "${pane_indices[$i]:-$i}" "$i" "$i" >> "$indexes_file"
+    fi
+  done
+  sort -n -k1,1 -k2,2 "$indexes_file" | cut -f3
+  rm -f "$indexes_file"
+}
+
+configure_restored_leader_pane() {
+  local pane_id="$1" restore_index="$2" ordinal="$3" sidecar_created sidecar_position
+  "$TMUX_BIN" set-option -pt "$pane_id" @cbridge_restore_order "$ordinal" >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -pt "$pane_id" @cbridge_sidecar_leader 0 >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -pt "$pane_id" @cbridge_sidecar_created 0 >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -pt "$pane_id" @cbridge_sidecar_position "" >/dev/null 2>&1 || true
+
+  sidecar_created="${sidecar_createds[$restore_index]:-}"
+  sidecar_position="${sidecar_positions[$restore_index]:-}"
+  if [[ "$sidecar_created" == "1" ]]; then
+    [[ -n "$sidecar_position" ]] || sidecar_position=right
+    "$TMUX_BIN" set-option -pt "$pane_id" @cbridge_sidecar_leader 1 >/dev/null 2>&1 || true
+    "$TMUX_BIN" set-option -pt "$pane_id" @cbridge_sidecar_created 1 >/dev/null 2>&1 || true
+    "$TMUX_BIN" set-option -pt "$pane_id" @cbridge_sidecar_position "$sidecar_position" >/dev/null 2>&1 || true
+    "$TMUX_BIN" set-option -pt "$pane_id" @cbridge_border_title "#[fg=colour14,bold]${rooms[$restore_index]} #[fg=colour245]│ #[fg=colour229,bold]복원된 리더 세션" >/dev/null 2>&1 || true
+  fi
+}
+
+leader_body_panes_for_target() {
+  local target="$1"
+  "$TMUX_BIN" list-panes -t "$target" -F '#{pane_id}|#{@cbridge_room}|#{pane_current_path}|#{@cbridge_thread_id}|#{@cbridge_header_for}|#{@cbridge_title_header}|#{@cbridge_sidecar_peer}' 2>/dev/null |
+    awk -F'|' '$2 ~ /^LEADER-/ && $5 == "" && $6 != "1" && $7 != "1" { print $1 "|" $2 "|" $3 "|" $4 }'
+}
+
+largest_non_header_pane_in_window() {
+  local target="$1"
+  "$TMUX_BIN" list-panes -t "$target" -F '#{pane_width}|#{pane_height}|#{pane_id}|#{@cbridge_header_for}|#{@cbridge_title_header}' 2>/dev/null |
+    awk -F'|' '$4 == "" && $5 != "1" { printf "%08d\t%08d\t%s\n", $2, $1, $3 }' |
+    sort -nr -k1,1 -k2,2 |
+    head -n 1 |
+    cut -f3
+}
+
+window_id_for_target() {
+  local target="$1"
+  "$TMUX_BIN" display-message -p -t "$target" '#{window_id}' 2>/dev/null || true
+}
+
+existing_restore_anchor_pane() {
+  local target="$1"
+  "$TMUX_BIN" list-panes -t "$target" -F '#{pane_id}|#{@cbridge_restore_anchor}|#{@cbridge_room}|#{@cbridge_header_for}|#{@cbridge_title_header}' 2>/dev/null |
+    awk -F'|' '$2 == "1" && $3 == "" && $4 == "" && $5 != "1" { print $1; exit }'
+}
+
+create_restore_anchor_pane() {
+  local target="$1" cwd="$2" window_target active_pane existing pane
+  [[ -n "$cwd" && -d "$cwd" ]] || cwd="$RESTORE_CWD"
+
+  window_target="$(window_id_for_target "$target")"
+  [[ -n "$window_target" ]] || return 1
+
+  existing="$(existing_restore_anchor_pane "$window_target")"
+  if [[ -n "$existing" ]]; then
+    print -r -- "$existing"
+    return 0
+  fi
+
+  active_pane="$("$TMUX_BIN" display-message -p -t "$window_target" '#{pane_id}' 2>/dev/null || true)"
+  pane="$("$TMUX_BIN" split-window -d -P -F '#{pane_id}' -t "$window_target" -c "$cwd" 2>/dev/null || true)"
+  [[ -n "$pane" ]] || return 1
+
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_restore_anchor 1 >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_room "" >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_thread_id "" >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_restore_order "" >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_border_title "임시 복구 pane" >/dev/null 2>&1 || true
+  [[ -n "$active_pane" ]] && "$TMUX_BIN" select-pane -t "$active_pane" >/dev/null 2>&1 || true
+  print -r -- "$pane"
+}
+
+remove_restore_anchor_pane() {
+  local pane="$1"
+  [[ -n "$pane" ]] || return 0
+  "$TMUX_BIN" kill-pane -t "$pane" 2>/dev/null || true
+}
+
+remove_title_headers_for_pane() {
+  local body_pane="$1" header_pane
+  while IFS= read -r header_pane; do
+    [[ -n "${header_pane:-}" ]] || continue
+    "$TMUX_BIN" kill-pane -t "$header_pane" 2>/dev/null || true
+  done < <("$TMUX_BIN" list-panes -a -F '#{pane_id}|#{@cbridge_header_for}|#{@cbridge_title_header}' 2>/dev/null |
+    awk -F'|' -v body="$body_pane" '$2 == body && $3 == "1" { print $1 }')
+}
+
+find_existing_leader_pane_for_room() {
+  local room="$1" thread="$2" target="$3"
+  local session window pane pane_room pane_thread header_for title_header sidecar_peer
+  while IFS='|' read -r session window pane pane_room pane_thread header_for title_header sidecar_peer; do
+    [[ "$session" == cbridge-leaders-* ]] || continue
+    [[ "$session" == "$LEADER_TAB_SESSION_PREFIX"-* ]] && continue
+    [[ "$session:$window" == "$target" ]] && continue
+    [[ "$pane_room" == "$room" ]] || continue
+    [[ "$pane_thread" == "$thread" ]] || continue
+    [[ -z "$header_for" && "$title_header" != "1" && "$sidecar_peer" != "1" ]] || continue
+    print -r -- "$pane"
+    return 0
+  done < <("$TMUX_BIN" list-panes -a -F '#{session_name}|#{window_name}|#{pane_id}|#{@cbridge_room}|#{@cbridge_thread_id}|#{@cbridge_header_for}|#{@cbridge_title_header}|#{@cbridge_sidecar_peer}' 2>/dev/null)
+  return 1
+}
+
+move_existing_leader_pane_to_window() {
+  local window="$1" restore_index="$2" ordinal="$3"
+  local target="$LEADERS_SESSION:$window" room="${rooms[$restore_index]}" pane split_target
+  pane="$(find_existing_leader_pane_for_room "$room" "${threads[$restore_index]}" "$target" 2>/dev/null || true)"
+  [[ -n "$pane" ]] || return 1
+
+  remove_title_headers_for_pane "$pane"
+  split_target="$(largest_non_header_pane_in_window "$target")"
+  [[ -n "$split_target" ]] || split_target="$target"
+  "$TMUX_BIN" join-pane -d -s "$pane" -t "$split_target" 2>/dev/null || return 1
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_room "$room" >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_thread_id "${threads[$restore_index]}" >/dev/null 2>&1 || true
+  configure_restored_leader_pane "$pane" "$restore_index" "$ordinal"
+  log "moved existing missing leader into $target: $room"
+}
+
+spawn_missing_leader_pane_in_window() {
+  local window="$1" restore_index="$2" ordinal="$3"
+  local target="$LEADERS_SESSION:$window" room thread cwd cmd pane split_target
+  room="${rooms[$restore_index]}"
+  thread="${threads[$restore_index]}"
+  cwd="${cwds[$restore_index]}"
+  post_room "$room"
+  cmd="$(leader_cmd "$room" "$thread" "$cwd")"
+  split_target="$(largest_non_header_pane_in_window "$target")"
+  [[ -n "$split_target" ]] || split_target="$target"
+  pane="$("$TMUX_BIN" split-window -d -P -F '#{pane_id}' -t "$split_target" -c "$cwd" "$cmd")"
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_room "$room" >/dev/null 2>&1 || true
+  "$TMUX_BIN" set-option -pt "$pane" @cbridge_thread_id "$thread" >/dev/null 2>&1 || true
+  configure_restored_leader_pane "$pane" "$restore_index" "$ordinal"
+  [[ "${pane_actives[$restore_index]:-}" == "1" ]] && "$TMUX_BIN" select-pane -t "$pane" >/dev/null 2>&1 || true
+  pause_after_leader_start
+  log "spawned missing leader in $target: $room"
+}
+
+validate_leader_window_rooms() {
+  local window="$1" target="$LEADERS_SESSION:$window"
+  local idx room thread pane cwd pane_thread failed=0
+  typeset -A expected expected_threads counts
+
+  for idx in "${(@f)$(leader_indexes_for_window "$window")}"; do
+    room="${rooms[$idx]}"
+    thread="${threads[$idx]}"
+    expected[$room]=1
+    expected_threads[$room]="$thread"
+    counts[$room]=0
+  done
+
+  while IFS='|' read -r pane room cwd pane_thread; do
+    [[ -n "${expected[$room]:-}" ]] || continue
+    if [[ "$pane_thread" != "${expected_threads[$room]}" ]]; then
+      log "leader window validation found stale thread in $target: $room thread=${pane_thread:-none}"
+      failed=1
+      continue
+    fi
+    counts[$room]=$(( ${counts[$room]:-0} + 1 ))
+  done < <(leader_body_panes_for_target "$target")
+
+  for room in "${(@k)expected}"; do
+    if [[ "${counts[$room]:-0}" != "1" ]]; then
+      log "leader window validation failed for $target: $room count=${counts[$room]:-0}"
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+repair_missing_leaders_for_window() {
+  local window="$1" target="$LEADERS_SESSION:$window"
+  local idx ordinal room pane cwd pane_thread
+  typeset -A present expected_threads
+
+  for idx in "${(@f)$(leader_indexes_for_window "$window")}"; do
+    expected_threads[${rooms[$idx]}]="${threads[$idx]}"
+  done
+
+  while IFS='|' read -r pane room cwd pane_thread; do
+    [[ -n "${room:-}" ]] || continue
+    [[ "$pane_thread" == "${expected_threads[$room]:-}" ]] || continue
+    present[$room]=1
+  done < <(leader_body_panes_for_target "$target")
+
+  ordinal=0
+  for idx in "${(@f)$(leader_indexes_for_window "$window")}"; do
+    ordinal=$(( ordinal + 1 ))
+    room="${rooms[$idx]}"
+    [[ -n "${present[$room]:-}" ]] && continue
+    if move_existing_leader_pane_to_window "$window" "$idx" "$ordinal"; then
+      present[$room]=1
+      continue
+    fi
+    if spawn_missing_leader_pane_in_window "$window" "$idx" "$ordinal"; then
+      present[$room]=1
+    else
+      log "could not restore missing leader in $target: $room"
+    fi
+  done
+
+  validate_leader_window_rooms "$window" || return 1
+}
+
+normalize_existing_leader_window() {
+  local window="$1"
+  local target="$LEADERS_SESSION:$window"
+  "$TMUX_BIN" has-session -t "$target" 2>/dev/null || return 0
+
+  local expected_file pane room cwd thread idx restore_anchor_pane
+  typeset -A seen_rooms expected_threads
+  expected_file="$(mktemp)"
+  for idx in "${(@f)$(leader_indexes_for_window "$window")}"; do
+    room="${rooms[$idx]}"
+    expected_threads[$room]="${threads[$idx]}"
+    print -r -- "$room" >> "$expected_file"
+  done
+  ensure_restore_anchor() {
+    local anchor_cwd="$1"
+    [[ -n "${restore_anchor_pane:-}" ]] || restore_anchor_pane="$(create_restore_anchor_pane "$target" "$anchor_cwd" 2>/dev/null || true)"
+    [[ -n "${restore_anchor_pane:-}" ]]
+  }
+  while IFS='|' read -r pane room cwd thread; do
+    [[ -n "${room:-}" ]] || continue
+    if ! grep -Fqx -- "$room" "$expected_file"; then
+      if ! ensure_restore_anchor "$cwd"; then
+        log "skipped moving unexpected leader from $target; restore anchor unavailable: $room"
+      elif park_leader_pane_in_peer_window "$pane" "$room" "$cwd"; then
+        log "moved unexpected leader pane out of $target: $room"
+      else
+        log "could not move unexpected leader pane out of $target: $room"
+      fi
+    elif [[ "$thread" != "${expected_threads[$room]}" ]]; then
+      if ! ensure_restore_anchor "$cwd"; then
+        log "skipped moving stale leader from $target; restore anchor unavailable: $room"
+      elif park_leader_pane_in_peer_window "$pane" "$room" "$cwd"; then
+        log "moved stale leader pane out of $target: $room"
+      else
+        log "could not move stale leader pane out of $target: $room"
+      fi
+    elif [[ -n "${seen_rooms[$room]:-}" ]]; then
+      if ! ensure_restore_anchor "$cwd"; then
+        log "skipped moving duplicate leader from $target; restore anchor unavailable: $room"
+      elif park_leader_pane_in_peer_window "$pane" "$room" "$cwd"; then
+        log "moved duplicate leader pane out of $target: $room"
+      else
+        log "could not move duplicate leader pane out of $target: $room"
+      fi
+    else
+      seen_rooms[$room]=1
+    fi
+  done < <(leader_body_panes_for_target "$target")
+  rm -f "$expected_file"
+
+  if ! repair_missing_leaders_for_window "$window"; then
+    log "leader repair validation failed for $target"
+    REPAIR_VALIDATION_FAILED=1
+  else
+    remove_restore_anchor_pane "$restore_anchor_pane"
+  fi
+
+  if [[ "$APPLY_LAYOUT" == "1" && -x "$LAYOUT_SCRIPT" ]]; then
+    CBRIDGE_LAYOUT_QUIET=1 "$LAYOUT_SCRIPT" "$LEADER_WINDOW_LAYOUT" "$target" >/dev/null 2>&1 || log "leader layout normalize skipped for $target"
+  fi
+}
+
 create_leader_window() {
   local window="$1"
   typeset -a indexes
-  for (( i=1; i<=${#rooms[@]}; i++ )); do
-    [[ "$(leader_window_for_group "${room_groups[$i]}")" == "$window" ]] && indexes+=("$i")
-  done
+  indexes=("${(@f)$(leader_indexes_for_window "$window")}")
   (( ${#indexes[@]} == 0 )) && return
   if "$TMUX_BIN" list-windows -t "$LEADERS_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$window"; then
     log "$LEADERS_SESSION:$window already exists; skipping"
     return 0
   fi
 
+  typeset -a created_panes
   local first="${indexes[1]}" room thread cwd cmd pane active_pane idx
+  largest_pane_in_window() {
+    "$TMUX_BIN" list-panes -t "$LEADERS_SESSION:$window" -F '#{pane_width} #{pane_height} #{pane_id}' 2>/dev/null |
+      sort -nr -k2,2 -k1,1 |
+      head -n 1 |
+      cut -d ' ' -f 3
+  }
+
   room="${rooms[$first]}"; thread="${threads[$first]}"; cwd="${cwds[$first]}"
   post_room "$room"
   cmd="$(leader_cmd "$room" "$thread" "$cwd")"
@@ -202,24 +1009,43 @@ create_leader_window() {
   fi
   "$TMUX_BIN" set-option -pt "$pane" @cbridge_room "$room" >/dev/null 2>&1 || true
   "$TMUX_BIN" set-option -pt "$pane" @cbridge_thread_id "$thread" >/dev/null 2>&1 || true
+  created_panes+=("$pane")
+  configure_restored_leader_pane "$pane" "$first" 1
   [[ "${pane_actives[$first]:-}" == "1" ]] && active_pane="$pane"
+  pause_after_leader_start
 
   for (( j=2; j<=${#indexes[@]}; j++ )); do
     idx="${indexes[$j]}"
     room="${rooms[$idx]}"; thread="${threads[$idx]}"; cwd="${cwds[$idx]}"
     post_room "$room"
     cmd="$(leader_cmd "$room" "$thread" "$cwd")"
-    pane="$("$TMUX_BIN" split-window -d -P -F '#{pane_id}' -t "$LEADERS_SESSION:$window" -c "$cwd" "$cmd")"
+    split_target="$(largest_pane_in_window)"
+    [[ -n "$split_target" ]] || split_target="$LEADERS_SESSION:$window"
+    pane="$("$TMUX_BIN" split-window -d -P -F '#{pane_id}' -t "$split_target" -c "$cwd" "$cmd")"
+    "$TMUX_BIN" select-layout -t "$LEADERS_SESSION:$window" tiled >/dev/null 2>&1 || true
     "$TMUX_BIN" set-option -pt "$pane" @cbridge_room "$room" >/dev/null 2>&1 || true
     "$TMUX_BIN" set-option -pt "$pane" @cbridge_thread_id "$thread" >/dev/null 2>&1 || true
+    created_panes+=("$pane")
+    configure_restored_leader_pane "$pane" "$idx" "$j"
     [[ "${pane_actives[$idx]:-}" == "1" ]] && active_pane="$pane"
+    pause_after_leader_start
   done
 
-  case "${#indexes[@]}" in
-    1) ;;
-    2) "$TMUX_BIN" select-layout -t "$LEADERS_SESSION:$window" even-horizontal >/dev/null ;;
-    *) "$TMUX_BIN" select-layout -t "$LEADERS_SESSION:$window" tiled >/dev/null ;;
-  esac
+  if [[ "$APPLY_LAYOUT" == "1" ]]; then
+    CBRIDGE_LAYOUT_QUIET=1 "$LAYOUT_SCRIPT" "$LEADER_WINDOW_LAYOUT" "$LEADERS_SESSION:$window" "${active_pane:-${created_panes[1]}}" >/dev/null 2>&1 || {
+      case "${#indexes[@]}" in
+        1) ;;
+        2|3) "$TMUX_BIN" select-layout -t "$LEADERS_SESSION:$window" even-horizontal >/dev/null ;;
+        *) "$TMUX_BIN" select-layout -t "$LEADERS_SESSION:$window" tiled >/dev/null ;;
+      esac
+    }
+  else
+    case "${#indexes[@]}" in
+      1) ;;
+      2|3) "$TMUX_BIN" select-layout -t "$LEADERS_SESSION:$window" even-horizontal >/dev/null ;;
+      *) "$TMUX_BIN" select-layout -t "$LEADERS_SESSION:$window" tiled >/dev/null ;;
+    esac
+  fi
   [[ -n "${active_pane:-}" ]] && "$TMUX_BIN" select-pane -t "$active_pane" >/dev/null 2>&1 || true
 }
 
@@ -244,8 +1070,37 @@ ensure_leader_tab_session() {
 
 ghostty_attach_cmd() {
   local window="$1"
-  printf 'printf "\\033]0;cbridge %s\\007"; exec %s attach -t %s' \
-    "$window" "$(quote "$TMUX_BIN")" "$(quote "$(leader_tab_session "$window")")"
+  local attach_path="$GHOSTTY_ATTACH_DIR/cbridge-ghostty-attach-$window"
+  mkdir -p "$GHOSTTY_ATTACH_DIR"
+  chmod +x "$GHOSTTY_ATTACH_HELPER" 2>/dev/null || true
+  ln -sf "$GHOSTTY_ATTACH_HELPER" "$attach_path"
+  print -r -- "$attach_path"
+}
+
+ghostty_leader_tab_open() {
+  local window="$1" result
+  /usr/bin/osascript -e 'tell application "System Events" to exists process "ghostty"' 2>/dev/null |
+    grep -qx true || return 1
+
+  result="$(/usr/bin/osascript - "cbridge $window" <<'APPLESCRIPT' 2>/dev/null || true
+on run argv
+  set targetTitle to item 1 of argv
+  tell application id "com.mitchellh.ghostty"
+    repeat with w in windows
+      repeat with t in tabs of w
+        try
+          if (name of t as text) contains targetTitle then
+            return "1"
+          end if
+        end try
+      end repeat
+    end repeat
+  end tell
+  return "0"
+end run
+APPLESCRIPT
+)"
+  [[ "$result" == "1" ]]
 }
 
 open_ghostty_native_tab() {
@@ -256,8 +1111,8 @@ on run argv
   set tabTitle to item 2 of argv
   set tabCommand to item 3 of argv
   tell application "Ghostty"
-    set cfg to new surface configuration from {initial working directory:workDir, command:"/bin/zsh", initial input:(tabCommand & (ASCII character 10))}
-    set newTab to new tab in front window with configuration cfg
+  set cfg to new surface configuration from {initial working directory:workDir, command:tabCommand}
+  set newTab to new tab in front window with configuration cfg
     perform action ("set_tab_title:" & tabTitle) on focused terminal of newTab
   end tell
 end run
@@ -282,14 +1137,14 @@ on run argv
     activate
     set firstTitle to item 4 of argv
     set firstCommand to item 5 of argv
-    set firstConfig to new surface configuration from {initial working directory:workDir, command:"/bin/zsh", initial input:(firstCommand & (ASCII character 10))}
+    set firstConfig to new surface configuration from {initial working directory:workDir, command:firstCommand}
     set leaderWindow to new window with configuration firstConfig
     perform action ("set_tab_title:" & firstTitle) on focused terminal of selected tab of leaderWindow
     delay tabDelay
     repeat with i from 6 to count argv by 2
       set tabTitle to item i of argv
       set tabCommand to item (i + 1) of argv
-      set cfg to new surface configuration from {initial working directory:workDir, command:"/bin/zsh", initial input:(tabCommand & (ASCII character 10))}
+      set cfg to new surface configuration from {initial working directory:workDir, command:tabCommand}
       set newTab to new tab in leaderWindow with configuration cfg
       perform action ("set_tab_title:" & tabTitle) on focused terminal of newTab
       delay tabDelay
@@ -304,39 +1159,64 @@ APPLESCRIPT
 for (( i=1; i<=${#rooms[@]}; i++ )); do
   create_peer "${rooms[$i]}" "${cwds[$i]}"
 done
+prune_all_peer_placeholders
 
 typeset -a leader_windows
 active_leader_window=""
+REPAIR_VALIDATION_FAILED=0
+leader_window_order_file="$(mktemp)"
+typeset -a seen_leader_windows
 for (( i=1; i<=${#room_groups[@]}; i++ )); do
   window="$(leader_window_for_group "${room_groups[$i]}")"
-  (( ${leader_windows[(Ie)$window]} == 0 )) && leader_windows+=("$window")
+  if (( ${seen_leader_windows[(Ie)$window]} == 0 )); then
+    seen_leader_windows+=("$window")
+    printf '%08d\t%08d\t%s\n' "${window_indices[$i]:-$i}" "$i" "$window" >> "$leader_window_order_file"
+  fi
   [[ "${window_actives[$i]:-}" == "1" ]] && active_leader_window="$window"
 done
+leader_windows=("${(@f)$(sort -n -k1,1 -k2,2 "$leader_window_order_file" | cut -f3)}")
+rm -f "$leader_window_order_file"
 
 for window in "${leader_windows[@]}"; do
   create_leader_window "$window"
+  normalize_existing_leader_window "$window"
 done
 configure_leader_tabs
 [[ -n "$active_leader_window" ]] && "$TMUX_BIN" select-window -t "$LEADERS_SESSION:$active_leader_window" >/dev/null 2>&1 || true
 for window in "${leader_windows[@]}"; do
   ensure_leader_tab_session "$window"
 done
-"$TMUX_BIN" set-option -gq @cbridge_next_leader_id 7 || true
+next_leader_id=1
+for room in "${rooms[@]}"; do
+  if [[ "$room" =~ '^LEADER-[0-9]+$' ]]; then
+    room_id="${room#LEADER-}"
+    if (( room_id >= next_leader_id )); then
+      next_leader_id=$(( room_id + 1 ))
+    fi
+  fi
+done
+"$TMUX_BIN" set-option -gq @cbridge_next_leader_id "$next_leader_id" || true
+prune_all_peer_placeholders
+
+if [[ "${REPAIR_VALIDATION_FAILED:-0}" == "1" ]]; then
+  log "restore failed; leader repair validation failed"
+  exit 1
+fi
 
 if [[ "$OPEN_WINDOWS" == "1" && -d "$GHOSTTY_APP" ]]; then
   if "$TMUX_BIN" has-session -t "$LEADERS_SESSION" 2>/dev/null; then
     typeset -a missing_windows
     for window in "${leader_windows[@]}"; do
-      if ! pgrep -f "tmux attach -t $(leader_tab_session "$window")" >/dev/null 2>&1; then
+      if ! ghostty_leader_tab_open "$window"; then
         missing_windows+=("$window")
       fi
     done
     if (( ${#missing_windows[@]} == ${#leader_windows[@]} )); then
       leader_windows=("${missing_windows[@]}")
-      open_ghostty_leader_tabs || true
+      open_ghostty_leader_tabs || log "could not open Ghostty leader tabs"
     else
       for window in "${missing_windows[@]}"; do
-        open_ghostty_native_tab "$window" || true
+        open_ghostty_native_tab "$window" || log "could not open Ghostty leader tab: $window"
       done
     fi
   fi

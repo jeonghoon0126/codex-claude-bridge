@@ -1,0 +1,736 @@
+#!/bin/zsh
+set -euo pipefail
+
+HOME_DIR="${HOME:-/Users/wjh}"
+BRIDGE_DIR="${CBRIDGE_DIR:-$HOME_DIR/codex-claude-bridge}"
+LOG_DIR="$HOME_DIR/.codex-claude-bridge/logs"
+LOG_FILE="$LOG_DIR/load-governor.log"
+RESUME_STATE_FILE="$HOME_DIR/.codex-claude-bridge/load-governor-running-windows.tsv"
+STATUS_FILE="${CBRIDGE_GOVERNOR_STATUS_FILE:-$HOME_DIR/.codex-claude-bridge/load-governor-status.json}"
+LAST_ACTION_FILE="$HOME_DIR/.codex-claude-bridge/load-governor-last-action-at"
+ACTION_LOG_FILE="$HOME_DIR/.codex-claude-bridge/load-governor-actions.log"
+LEADERS_SESSION="${CBRIDGE_GOVERNOR_LEADERS_SESSION:-cbridge-leaders-main}"
+LEADER_SESSIONS="${CBRIDGE_GOVERNOR_LEADER_SESSIONS:-${LEADERS_SESSION},cbridge-leaders-slack}"
+INTERVAL="${CBRIDGE_GOVERNOR_INTERVAL_SECONDS:-10}"
+WINDOWSERVER_HIGH="${CBRIDGE_GOVERNOR_WINDOWSERVER_HIGH:-20}"
+WINDOWSERVER_RECOVER="${CBRIDGE_GOVERNOR_WINDOWSERVER_RECOVER:-12}"
+SCREEN_PRESSURE_HIGH="${CBRIDGE_GOVERNOR_SCREEN_PRESSURE_HIGH:-35}"
+SCREEN_RESTORE_CPU="${CBRIDGE_GOVERNOR_SCREEN_RESTORE_CPU:-$WINDOWSERVER_HIGH}"
+SCREEN_PROCESS_MIN_CPU="${CBRIDGE_GOVERNOR_SCREEN_PROCESS_MIN_CPU:-3}"
+HEAVY_SEARCH_MIN_CPU="${CBRIDGE_GOVERNOR_HEAVY_SEARCH_MIN_CPU:-20}"
+HIGH_STREAK_REQUIRED="${CBRIDGE_GOVERNOR_HIGH_STREAK_REQUIRED:-2}"
+ACTIVE_WINDOWS="${CBRIDGE_GOVERNOR_ACTIVE_WINDOWS:-}"
+RUNNING_WINDOWS="${CBRIDGE_GOVERNOR_RUNNING_WINDOWS:-}"
+PARK_INACTIVE="${CBRIDGE_GOVERNOR_PARK_INACTIVE:-1}"
+RESUME_TTL_SECONDS="${CBRIDGE_GOVERNOR_RESUME_TTL_SECONDS:-600}"
+REMOVE_TITLE_HEADERS="${CBRIDGE_GOVERNOR_REMOVE_TITLE_HEADERS:-0}"
+PROTECTED_APPS="${CBRIDGE_GOVERNOR_PROTECTED_APPS:-Notion,Figma,Ghostty}"
+STATUS_STALE_SECONDS="${CBRIDGE_GOVERNOR_STATUS_STALE_SECONDS:-$(( INTERVAL * 3 ))}"
+PROCESS_FIXTURE="${CBRIDGE_GOVERNOR_PROCESS_FIXTURE:-}"
+ACTION_PROCESS_FIXTURE="${CBRIDGE_GOVERNOR_ACTION_PROCESS_FIXTURE:-}"
+WINDOWSERVER_CPU_FIXTURE="${CBRIDGE_GOVERNOR_WINDOWSERVER_CPU_FIXTURE:-}"
+TEST_MODE="${CBRIDGE_GOVERNOR_TEST_MODE:-0}"
+
+[[ "$INTERVAL" == <-> ]] || INTERVAL=10
+[[ "$WINDOWSERVER_HIGH" == <-> ]] || WINDOWSERVER_HIGH=20
+[[ "$WINDOWSERVER_RECOVER" == <-> ]] || WINDOWSERVER_RECOVER=12
+[[ "$SCREEN_PRESSURE_HIGH" == <-> ]] || SCREEN_PRESSURE_HIGH=35
+[[ "$SCREEN_RESTORE_CPU" == <-> ]] || SCREEN_RESTORE_CPU="$WINDOWSERVER_HIGH"
+[[ "$SCREEN_PROCESS_MIN_CPU" == <-> ]] || SCREEN_PROCESS_MIN_CPU=3
+[[ "$HEAVY_SEARCH_MIN_CPU" == <-> ]] || HEAVY_SEARCH_MIN_CPU=20
+[[ "$HIGH_STREAK_REQUIRED" == <-> ]] || HIGH_STREAK_REQUIRED=2
+[[ "$RESUME_TTL_SECONDS" == <-> ]] || RESUME_TTL_SECONDS=600
+[[ "$STATUS_STALE_SECONDS" == <-> ]] || STATUS_STALE_SECONDS=$(( INTERVAL * 3 ))
+(( INTERVAL >= 5 )) || INTERVAL=5
+(( SCREEN_PRESSURE_HIGH >= WINDOWSERVER_HIGH )) || SCREEN_PRESSURE_HIGH="$WINDOWSERVER_HIGH"
+(( SCREEN_RESTORE_CPU <= SCREEN_PRESSURE_HIGH )) || SCREEN_RESTORE_CPU="$WINDOWSERVER_HIGH"
+(( SCREEN_PROCESS_MIN_CPU >= 1 )) || SCREEN_PROCESS_MIN_CPU=1
+(( HEAVY_SEARCH_MIN_CPU >= 5 )) || HEAVY_SEARCH_MIN_CPU=20
+(( HIGH_STREAK_REQUIRED >= 1 )) || HIGH_STREAK_REQUIRED=1
+(( RESUME_TTL_SECONDS >= 30 )) || RESUME_TTL_SECONDS=30
+(( STATUS_STALE_SECONDS >= INTERVAL )) || STATUS_STALE_SECONDS=$(( INTERVAL * 3 ))
+
+mkdir -p "$LOG_DIR"
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+}
+
+has_tmux_session() {
+  local session="${1:-$LEADERS_SESSION}"
+  tmux has-session -t "$session" >/dev/null 2>&1
+}
+
+leader_sessions() {
+  local session
+  typeset -A seen
+  for session in "${(@s:,:)LEADER_SESSIONS}"; do
+    [[ -n "$session" ]] || continue
+    [[ -n "${seen[$session]:-}" ]] && continue
+    seen[$session]=1
+    has_tmux_session "$session" && print -r -- "$session"
+  done
+}
+
+has_any_leader_session() {
+  local session
+  for session in "${(@s:,:)LEADER_SESSIONS}"; do
+    [[ -n "$session" ]] || continue
+    has_tmux_session "$session" && return 0
+  done
+  return 1
+}
+
+leader_panes() {
+  local format="$1"
+  local session
+  leader_sessions | while IFS= read -r session; do
+    tmux list-panes -s -t "$session" -F "$format" 2>/dev/null || true
+  done
+}
+
+window_is_active() {
+  local window="${1:u}"
+  local active
+  for active in "${(@s:,:)ACTIVE_WINDOWS}"; do
+    active="${active:u}"
+    [[ "$active" == "ALL" || "$active" == "$window" ]] && return 0
+  done
+  return 1
+}
+
+leader_is_active() {
+  local window="${1:u}"
+  local room="${2:-}"
+  room="${room:u}"
+  window_is_active "$window" || { [[ -n "$room" ]] && window_is_active "$room"; }
+}
+
+cleanup_resume_state() {
+  [[ -f "$RESUME_STATE_FILE" ]] || return 0
+  local now tmp
+  now="$(date +%s)"
+  tmp="$(mktemp)"
+  awk -v now="$now" 'NF >= 2 && $2 >= now {print $1 "\t" $2}' "$RESUME_STATE_FILE" > "$tmp" || true
+  mv "$tmp" "$RESUME_STATE_FILE"
+}
+
+window_is_running() {
+  local window="${1:u}"
+  local running
+  for running in "${(@s:,:)RUNNING_WINDOWS}"; do
+    running="${running:u}"
+    [[ "$running" == "ALL" || "$running" == "$window" ]] && return 0
+  done
+
+  cleanup_resume_state
+  [[ -f "$RESUME_STATE_FILE" ]] || return 1
+  awk -v window="$window" 'toupper($1) == window {found=1} END {exit found ? 0 : 1}' "$RESUME_STATE_FILE"
+}
+
+leader_is_running() {
+  local window="${1:u}"
+  local room="${2:-}"
+  room="${room:u}"
+  window_is_running "$window" || { [[ -n "$room" ]] && window_is_running "$room"; }
+}
+
+windowserver_cpu() {
+  if [[ -n "$WINDOWSERVER_CPU_FIXTURE" ]]; then
+    print -r -- "$WINDOWSERVER_CPU_FIXTURE"
+    return 0
+  fi
+  ps -axo pcpu=,comm= | awk '/WindowServer/ {sum += $1} END {printf "%.0f", sum}'
+}
+
+top_processes() {
+  if [[ -n "$PROCESS_FIXTURE" && -f "$PROCESS_FIXTURE" ]]; then
+    cat "$PROCESS_FIXTURE"
+    return 0
+  fi
+
+  ps -axo pid=,pcpu=,comm= |
+    awk '{
+      pid=$1
+      cpu=$2
+      $1=""
+      $2=""
+      sub(/^[[:space:]]+/, "", $0)
+      if (pid != "" && cpu != "" && $0 != "") {
+        printf "%s\t%s\t%s\n", pid, cpu, $0
+      }
+    }' |
+    sort -k2,2nr |
+    head -n 5
+}
+
+parked_leaders() {
+  has_any_leader_session || return 0
+  leader_panes '#{window_name}|#{pane_id}|#{pane_pid}|#{@cbridge_room}|#{@cbridge_parked}' |
+    awk -F'|' '$5 == "1" {print ($4 != "" ? $4 : $1)}' |
+    sort -u
+}
+
+leader_sessions_csv() {
+  local session
+  leader_sessions | while IFS= read -r session; do
+    print -r -- "$session"
+  done | paste -sd, -
+}
+
+last_action_at() {
+  [[ -f "$LAST_ACTION_FILE" ]] && cat "$LAST_ACTION_FILE" || true
+}
+
+remember_action() {
+  mkdir -p "${LAST_ACTION_FILE:h}"
+  date '+%Y-%m-%d %H:%M:%S' > "$LAST_ACTION_FILE"
+}
+
+record_action() {
+  local action="$*"
+  [[ -n "$action" ]] || return 0
+  mkdir -p "${ACTION_LOG_FILE:h}"
+  printf '%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$action" >> "$ACTION_LOG_FILE"
+  log "$action"
+}
+
+recent_actions() {
+  [[ -f "$ACTION_LOG_FILE" ]] || return 0
+  tail -n 5 "$ACTION_LOG_FILE" | awk -F'\t' '{print $2}'
+}
+
+write_status() {
+  local ws_cpu="${1:-$(windowserver_cpu)}"
+  local high_streak="${2:-0}"
+  local mode="${3:-monitor}"
+  local top_tmp="" status_tmp="" status_dir
+  if ! top_tmp="$(mktemp)"; then
+    log "status write skipped: could not create process tmp file"
+    return 0
+  fi
+  if ! status_tmp="$(mktemp)"; then
+    log "status write skipped: could not create status tmp file"
+    rm -f "$top_tmp"
+    return 0
+  fi
+  top_processes > "$top_tmp" || true
+
+  status_dir="${STATUS_FILE:h}"
+  if ! mkdir -p "$status_dir"; then
+    log "status write skipped: could not create status dir=${status_dir}"
+    rm -f "$top_tmp" "$status_tmp"
+    return 0
+  fi
+
+  if ! CBRIDGE_STATUS_UPDATED_AT="$(date '+%Y-%m-%d %H:%M:%S')" \
+    CBRIDGE_STATUS_UPDATED_EPOCH="$(date +%s)" \
+    CBRIDGE_STATUS_WINDOWSERVER_CPU="$ws_cpu" \
+    CBRIDGE_STATUS_HIGH_STREAK="$high_streak" \
+    CBRIDGE_STATUS_MODE="$mode" \
+    CBRIDGE_STATUS_LAST_ACTION_AT="$(last_action_at)" \
+    CBRIDGE_STATUS_RECENT_ACTIONS="$(recent_actions | paste -sd'|' -)" \
+    CBRIDGE_STATUS_LEADER_SESSIONS="$(leader_sessions_csv)" \
+    CBRIDGE_STATUS_PARKED_LEADERS="$(parked_leaders | paste -sd, -)" \
+    CBRIDGE_STATUS_TOP_FILE="$top_tmp" \
+    python3 - "$status_tmp" <<'PY'
+import json
+import os
+import sys
+
+def as_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+def as_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+top_processes = []
+top_file = os.environ.get("CBRIDGE_STATUS_TOP_FILE", "")
+if top_file:
+    with open(top_file, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t", 2)
+            if len(parts) != 3:
+                continue
+            pid, cpu, command = parts
+            top_processes.append({
+                "pid": as_int(pid),
+                "cpu": as_float(cpu),
+                "command": command,
+            })
+
+payload = {
+    "updated_at": os.environ.get("CBRIDGE_STATUS_UPDATED_AT", ""),
+    "updated_at_epoch": as_int(os.environ.get("CBRIDGE_STATUS_UPDATED_EPOCH", "0")),
+    "windowserver_cpu": as_int(os.environ.get("CBRIDGE_STATUS_WINDOWSERVER_CPU", "0")),
+    "high_streak": as_int(os.environ.get("CBRIDGE_STATUS_HIGH_STREAK", "0")),
+    "mode": os.environ.get("CBRIDGE_STATUS_MODE", "monitor"),
+    "last_action_at": os.environ.get("CBRIDGE_STATUS_LAST_ACTION_AT", ""),
+    "last_actions": [item for item in os.environ.get("CBRIDGE_STATUS_RECENT_ACTIONS", "").split("|") if item],
+    "leader_sessions": [item for item in os.environ.get("CBRIDGE_STATUS_LEADER_SESSIONS", "").split(",") if item],
+    "parked_leaders": [item for item in os.environ.get("CBRIDGE_STATUS_PARKED_LEADERS", "").split(",") if item],
+    "top_processes": top_processes[:5],
+}
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+PY
+  then
+    log "status write skipped: could not render status json"
+    rm -f "$top_tmp" "$status_tmp"
+    return 0
+  fi
+
+  if ! mv "$status_tmp" "$STATUS_FILE"; then
+    log "status write skipped: could not replace status_file=${STATUS_FILE}"
+    rm -f "$top_tmp" "$status_tmp"
+    return 0
+  fi
+  rm -f "$top_tmp"
+}
+
+print_status() {
+  if [[ ! -f "$STATUS_FILE" ]]; then
+    print "모니터 상태 파일이 아직 없습니다. 감시 작업이 한 번 실행되면 상태가 생깁니다."
+    return 0
+  fi
+
+  CBRIDGE_STATUS_STALE_SECONDS="$STATUS_STALE_SECONDS" python3 - "$STATUS_FILE" <<'PY'
+import json
+import os
+import time
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    status = json.load(handle)
+
+now = int(time.time())
+updated_epoch = int(status.get("updated_at_epoch") or 0)
+age = max(0, now - updated_epoch) if updated_epoch else 0
+stale_seconds = int(os.environ.get("CBRIDGE_STATUS_STALE_SECONDS") or 60)
+
+if not updated_epoch or age > stale_seconds:
+    print(f"모니터 갱신이 오래됐습니다. 마지막 갱신 {status.get('updated_at') or '알 수 없음'}")
+else:
+    print(f"WindowServer {status.get('windowserver_cpu', 0)}% · 마지막 갱신 {status.get('updated_at') or '알 수 없음'}")
+
+last_action = status.get("last_action_at") or ""
+if last_action:
+    print(f"최근 조치 {last_action}")
+else:
+    print("최근 조치 없음")
+
+parked = status.get("parked_leaders") or []
+print(f"일시정지 리더 {', '.join(parked) if parked else '없음'}")
+
+actions = status.get("last_actions") or []
+if actions:
+    print("최근 자동조치 " + " · ".join(str(item) for item in actions[-3:]))
+
+top = status.get("top_processes") or []
+if top:
+    labels = []
+    for item in top[:5]:
+        command = str(item.get("command") or "").split("/")[-1] or str(item.get("command") or "")
+        labels.append(f"{command} {item.get('cpu', 0):g}%")
+    print("상위 원인 " + " · ".join(labels))
+else:
+    print("상위 원인 기록 없음")
+PY
+}
+
+remove_leader_title_headers() {
+  [[ "$REMOVE_TITLE_HEADERS" == "1" ]] || return 0
+  tmux list-panes -a -F '#{session_name}|#{pane_id}|#{@cbridge_header_for}' 2>/dev/null |
+    awk -F'|' '$1 ~ /^cbridge-leaders-/ && $3 != "" {print $2}' |
+    while IFS= read -r pane_id; do
+      [[ -n "$pane_id" ]] || continue
+      tmux kill-pane -t "$pane_id" >/dev/null 2>&1 || true
+      log "removed cbridge title header pane=$pane_id"
+    done
+}
+
+descendant_pids() {
+  local root="$1"
+  ps -axo pid=,ppid= | awk -v root="$root" '
+    { children[$2] = children[$2] " " $1 }
+    END {
+      queue = root
+      while (queue != "") {
+        split(queue, nodes, " ")
+        queue = ""
+        for (i in nodes) {
+          parent = nodes[i]
+          if (parent == "") continue
+          split(children[parent], kids, " ")
+          for (j in kids) {
+            child = kids[j]
+            if (child == "") continue
+            print child
+            queue = queue " " child
+          }
+        }
+      }
+    }
+  '
+}
+
+process_tree_pids() {
+  local root="$1"
+  [[ "$root" == <-> ]] || return 0
+  printf '%s\n' "$root"
+  descendant_pids "$root"
+}
+
+is_own_process_tree() {
+  local root="$1"
+  local pid="$$"
+  while [[ "$pid" == <-> && "$pid" -gt 1 ]]; do
+    [[ "$pid" == "$root" ]] && return 0
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  done
+  return 1
+}
+
+apply_taskpolicy() {
+  local policy="$1"
+  local pid="$2"
+  [[ "$pid" == <-> ]] || return 0
+  if command -v taskpolicy >/dev/null 2>&1; then
+    if [[ "$policy" == "background" ]]; then
+      taskpolicy -b -p "$pid" >/dev/null 2>&1 || true
+    else
+      taskpolicy -B -p "$pid" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+process_rows() {
+  if [[ -n "$ACTION_PROCESS_FIXTURE" && -f "$ACTION_PROCESS_FIXTURE" ]]; then
+    cat "$ACTION_PROCESS_FIXTURE"
+    return 0
+  fi
+
+  ps -axo pid=,ppid=,pcpu=,command= |
+    awk '{
+      pid=$1
+      ppid=$2
+      cpu=$3
+      $1=""
+      $2=""
+      $3=""
+      sub(/^[[:space:]]+/, "", $0)
+      if (pid != "" && ppid != "" && cpu != "" && $0 != "") {
+        printf "%s\t%s\t%s\t%s\n", pid, ppid, cpu, $0
+      }
+    }'
+}
+
+mitigation_candidates() {
+  local ws_cpu="$1"
+  local table_tmp
+  table_tmp="$(mktemp)" || return 0
+  process_rows > "$table_tmp" || true
+
+  CBRIDGE_GOVERNOR_WS_CPU="$ws_cpu" \
+  CBRIDGE_GOVERNOR_SCREEN_PRESSURE_HIGH="$SCREEN_PRESSURE_HIGH" \
+  CBRIDGE_GOVERNOR_SCREEN_RESTORE_CPU="$SCREEN_RESTORE_CPU" \
+  CBRIDGE_GOVERNOR_SCREEN_PROCESS_MIN_CPU="$SCREEN_PROCESS_MIN_CPU" \
+  CBRIDGE_GOVERNOR_HEAVY_SEARCH_MIN_CPU="$HEAVY_SEARCH_MIN_CPU" \
+  python3 - "$table_tmp" <<'PY'
+import os
+import shlex
+import sys
+
+def as_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+def as_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+rows = []
+by_pid = {}
+with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        parts = line.rstrip("\n").split("\t", 3)
+        if len(parts) != 4:
+            continue
+        pid, ppid, cpu, command = parts
+        row = {
+            "pid": as_int(pid),
+            "ppid": as_int(ppid),
+            "cpu": as_float(cpu),
+            "command": command,
+        }
+        if row["pid"]:
+            rows.append(row)
+            by_pid[row["pid"]] = row
+
+def argv(command):
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+def cbridge_owned(row):
+    seen = set()
+    current = row
+    for _ in range(8):
+        if not current or current["pid"] in seen:
+            return False
+        seen.add(current["pid"])
+        command = current["command"]
+        if "CODEX_BRIDGE_ROOM=" in command or "codex-bridge.env.CODEX_BRIDGE_ROOM" in command:
+            return True
+        if "/codex-claude-bridge/" in command or "cbridge-" in command:
+            return True
+        current = by_pid.get(current["ppid"])
+    return False
+
+def home_wide_search(row):
+    args = argv(row["command"])
+    if not args:
+        return False
+    tool = os.path.basename(args[0])
+    if tool == "find":
+        return len(args) >= 2 and args[1] == "/Users/wjh"
+    if tool == "rg":
+        return "/Users/wjh" in args
+    return False
+
+screen_needles = [
+    "ControlCenter.app/Contents/MacOS/ControlCenter",
+    "DisplayLinkUserAgent",
+    "VTEncoderXPCService",
+    "avconferenced",
+]
+
+ws_cpu = as_int(os.environ.get("CBRIDGE_GOVERNOR_WS_CPU"))
+screen_high = as_int(os.environ.get("CBRIDGE_GOVERNOR_SCREEN_PRESSURE_HIGH"), 35)
+screen_restore = as_int(os.environ.get("CBRIDGE_GOVERNOR_SCREEN_RESTORE_CPU"), 20)
+screen_min_cpu = as_float(os.environ.get("CBRIDGE_GOVERNOR_SCREEN_PROCESS_MIN_CPU"), 3.0)
+heavy_search_min_cpu = as_float(os.environ.get("CBRIDGE_GOVERNOR_HEAVY_SEARCH_MIN_CPU"), 20.0)
+
+for row in rows:
+    if home_wide_search(row) and row["cpu"] >= heavy_search_min_cpu:
+        action = "heavy-search-terminated" if cbridge_owned(row) else "heavy-search-observed"
+        print(f"{action}\t{row['pid']}\t{row['command']}")
+
+if ws_cpu >= screen_high:
+    for row in rows:
+        if row["cpu"] < screen_min_cpu:
+            continue
+        if any(needle in row["command"] for needle in screen_needles):
+            print(f"screen-background\t{row['pid']}\t{row['command']}")
+elif ws_cpu < screen_restore:
+    for row in rows:
+        if any(needle in row["command"] for needle in screen_needles):
+            print(f"screen-foreground\t{row['pid']}\t{row['command']}")
+PY
+  rm -f "$table_tmp"
+}
+
+signal_process() {
+  local signal="$1"
+  local pid="$2"
+  [[ "$pid" == <-> ]] || return 0
+  if [[ "$TEST_MODE" == "1" ]]; then
+    return 0
+  fi
+  kill "-$signal" "$pid" >/dev/null 2>&1 || true
+}
+
+process_label() {
+  local command="$*"
+  local label="${command:t}"
+  label="${label%% --*}"
+  label="${label%% -psn_*}"
+  label="${label[1,100]}"
+  print -r -- "$label"
+}
+
+apply_automatic_mitigations() {
+  local ws_cpu="$1"
+  mitigation_candidates "$ws_cpu" | while IFS=$'\t' read -r action pid command; do
+    [[ -n "$action" && "$pid" == <-> ]] || continue
+    case "$action" in
+      screen-background)
+        apply_taskpolicy background "$pid"
+        record_action "screen-background pid=$pid command=$(process_label "$command")"
+        ;;
+      screen-foreground)
+        apply_taskpolicy foreground "$pid"
+        record_action "screen-foreground pid=$pid command=$(process_label "$command")"
+        ;;
+      heavy-search-terminated)
+        signal_process TERM "$pid"
+        record_action "heavy-search-terminated pid=$pid command=$(process_label "$command")"
+        ;;
+      heavy-search-observed)
+        apply_taskpolicy background "$pid"
+        record_action "heavy-search-observed pid=$pid command=$(process_label "$command")"
+        ;;
+    esac
+  done
+}
+
+background_process_tree() {
+  local root="$1"
+  process_tree_pids "$root" | while IFS= read -r pid; do
+    apply_taskpolicy background "$pid"
+  done
+}
+
+foreground_process_tree() {
+  local root="$1"
+  process_tree_pids "$root" | while IFS= read -r pid; do
+    apply_taskpolicy foreground "$pid"
+  done
+}
+
+park_process_tree() {
+  local root="$1"
+  descendant_pids "$root" | sort -rn | while IFS= read -r pid; do
+    [[ "$pid" == <-> ]] || continue
+    kill -STOP "$pid" >/dev/null 2>&1 || true
+  done
+}
+
+resume_process_tree() {
+  local root="$1"
+  process_tree_pids "$root" | while IFS= read -r pid; do
+    [[ "$pid" == <-> ]] || continue
+    kill -CONT "$pid" >/dev/null 2>&1 || true
+  done
+}
+
+background_inactive_leaders() {
+  has_any_leader_session || return 0
+
+  leader_panes '#{window_name}|#{pane_pid}|#{@cbridge_room}' |
+    awk -F'|' '$2 != "" && $3 ~ /^LEADER-/ {print $1 "|" $2 "|" $3}' |
+    sort -u |
+    while IFS='|' read -r window pane_pid room; do
+      [[ -n "$window" && "$pane_pid" == <-> ]] || continue
+      if leader_is_active "$window" "$room"; then
+        foreground_process_tree "$pane_pid"
+      else
+        background_process_tree "$pane_pid"
+      fi
+    done
+}
+
+park_inactive_leaders() {
+  [[ "$PARK_INACTIVE" == "1" ]] || return 0
+  has_any_leader_session || return 0
+
+  leader_panes '#{window_name}|#{pane_id}|#{pane_pid}|#{@cbridge_room}|#{@cbridge_parked}' |
+    awk -F'|' '$3 != "" && $4 ~ /^LEADER-/ {print $1 "|" $2 "|" $3 "|" $4 "|" $5}' |
+    sort -u |
+    while IFS='|' read -r window pane_id pane_pid room parked; do
+      [[ -n "$window" && "$pane_pid" == <-> ]] || continue
+      if leader_is_running "$window" "$room"; then
+        resume_process_tree "$pane_pid"
+        [[ "$parked" == "1" ]] && tmux set-option -pt "$pane_id" @cbridge_parked "" >/dev/null 2>&1 || true
+      elif is_own_process_tree "$pane_pid"; then
+        resume_process_tree "$pane_pid"
+        [[ "$parked" == "1" ]] && tmux set-option -pt "$pane_id" @cbridge_parked "" >/dev/null 2>&1 || true
+        log "skipped parking own cbridge process tree window=$window pane=$pane_id"
+      else
+        [[ "$parked" != "1" ]] && tmux set-option -pt "$pane_id" @cbridge_parked 1 >/dev/null 2>&1 || true
+        park_process_tree "$pane_pid"
+      fi
+    done
+}
+
+resume_window() {
+  local window="${1:u}"
+  [[ -n "$window" ]] || return 0
+  has_any_leader_session || return 0
+
+  local expires tmp
+  expires=$(( $(date +%s) + RESUME_TTL_SECONDS ))
+  mkdir -p "${RESUME_STATE_FILE:h}"
+  tmp="$(mktemp)"
+  cleanup_resume_state
+  [[ -f "$RESUME_STATE_FILE" ]] && awk -v window="$window" 'toupper($1) != window {print}' "$RESUME_STATE_FILE" > "$tmp" || true
+  printf '%s\t%s\n' "$window" "$expires" >> "$tmp"
+  mv "$tmp" "$RESUME_STATE_FILE"
+
+  leader_panes '#{window_name}|#{pane_id}|#{pane_pid}|#{@cbridge_room}' |
+    awk -F'|' -v window="$window" '$3 != "" && $4 ~ /^LEADER-/ && (toupper($1) == window || toupper($4) == window) {print $2 "|" $3}' |
+    while IFS='|' read -r pane_id pane_pid; do
+      resume_process_tree "$pane_pid"
+      tmux set-option -pt "$pane_id" @cbridge_parked "" >/dev/null 2>&1 || true
+    done
+  log "resumed cbridge leader window=$window ttl=${RESUME_TTL_SECONDS}s"
+}
+
+govern_once() {
+  local ws_cpu="${1:-$(windowserver_cpu)}"
+  remove_leader_title_headers
+  background_inactive_leaders
+  park_inactive_leaders
+  apply_automatic_mitigations "$ws_cpu"
+  remember_action
+  write_status "$ws_cpu" 0 "govern"
+  log "checked cbridge load guard: WindowServer=${ws_cpu}% leader_sessions=${LEADER_SESSIONS} active_windows=${ACTIVE_WINDOWS} running_windows=${RUNNING_WINDOWS} park_inactive=${PARK_INACTIVE} protected_apps=${PROTECTED_APPS}"
+}
+
+watch_governor() {
+  local high_streak=0
+  log "load governor started; interval=${INTERVAL}s high=${WINDOWSERVER_HIGH}% recover=${WINDOWSERVER_RECOVER}% leader_sessions=${LEADER_SESSIONS} active_windows=${ACTIVE_WINDOWS}"
+  while :; do
+    local ws_cpu
+    ws_cpu="$(windowserver_cpu)"
+    if (( ws_cpu >= WINDOWSERVER_HIGH )); then
+      high_streak=$(( high_streak + 1 ))
+    elif (( ws_cpu <= WINDOWSERVER_RECOVER )); then
+      high_streak=0
+    fi
+
+    if (( high_streak >= HIGH_STREAK_REQUIRED )); then
+      govern_once "$ws_cpu"
+      high_streak=0
+    else
+      background_inactive_leaders
+      remove_leader_title_headers
+      park_inactive_leaders
+      apply_automatic_mitigations "$ws_cpu"
+      write_status "$ws_cpu" "$high_streak" "monitor"
+    fi
+    sleep "$INTERVAL"
+  done
+}
+
+case "${1:-}" in
+  --resume-window)
+    resume_window "${2:-}"
+    ;;
+  --watch)
+    watch_governor
+    ;;
+  --status)
+    print_status
+    ;;
+  --once|"")
+    govern_once
+    ;;
+  *)
+    print -u2 "usage: $0 [--once|--watch|--status]"
+    exit 2
+    ;;
+esac

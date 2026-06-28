@@ -3,6 +3,8 @@ set -euo pipefail
 
 room="${1:-}"
 TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+HOME_DIR="${HOME:-/Users/wjh}"
+FOCUS_APP_STATE="$HOME_DIR/.codex-claude-bridge/focus-app"
 
 if [[ -z "$room" || "$room" != LEADER-* ]]; then
   exit 0
@@ -41,7 +43,40 @@ fi
 "$TMUX_BIN" set-option -pt "$pane_id" @cbridge_ack_click "$(date +%s%N)" 2>/dev/null || true
 "$TMUX_BIN" display-message -t "$pane_id" "${room} 답변으로 이동" 2>/dev/null || true
 
-if [[ -d /Applications/Ghostty.app ]]; then
+focus_terminal_tab() {
+  /usr/bin/osascript - "$window_name" <<'APPLESCRIPT' >/dev/null 2>&1 || true
+on run argv
+  set targetTitle to "cbridge " & item 1 of argv
+  tell application "System Events"
+    if not (exists process "Terminal") then return "0"
+  end tell
+  tell application "Terminal"
+    activate
+    repeat with w in windows
+      repeat with t in tabs of w
+        set customTitle to ""
+        set tabName to ""
+        try
+          set customTitle to custom title of t as text
+        end try
+        try
+          set tabName to name of t as text
+        end try
+        if customTitle starts with targetTitle or tabName starts with targetTitle then
+          set selected tab of w to t
+          set index of w to 1
+          activate
+          return "1"
+        end if
+      end repeat
+    end repeat
+  end tell
+  return "0"
+end run
+APPLESCRIPT
+}
+
+focus_ghostty_tab() {
   /usr/bin/osascript - "$window_name" <<'APPLESCRIPT' >/dev/null 2>&1 || true
 on run argv
   set targetTitle to "cbridge " & item 1 of argv
@@ -63,6 +98,19 @@ on run argv
   end tell
 end run
 APPLESCRIPT
+}
+
+preferred_focus_app="${CBRIDGE_FOCUS_APP:-}"
+if [[ -z "$preferred_focus_app" && -f "$FOCUS_APP_STATE" ]]; then
+  preferred_focus_app="$(<"$FOCUS_APP_STATE")"
+fi
+
+if [[ "$preferred_focus_app" == "Terminal" ]]; then
+  focus_terminal_tab
+elif [[ "$preferred_focus_app" == "Ghostty" && -d /Applications/Ghostty.app ]]; then
+  focus_ghostty_tab
+elif [[ -d /Applications/Ghostty.app ]]; then
+  focus_ghostty_tab
 elif [[ -d /Applications/Warp.app ]]; then
   /usr/bin/open -a Warp >/dev/null 2>&1 || true
 elif [[ -d /Applications/iTerm.app ]]; then

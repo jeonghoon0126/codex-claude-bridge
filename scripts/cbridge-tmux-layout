@@ -5,6 +5,13 @@ layout="${1:-}"
 target="${2:-}"
 active_pane="${3:-}"
 
+layout_notice() {
+  if [[ "${CBRIDGE_LAYOUT_QUIET:-0}" == "1" ]]; then
+    return 0
+  fi
+  tmux display-message "$@"
+}
+
 if [[ -z "$target" ]]; then
   target="$(tmux display-message -p '#{session_name}:#{window_index}')"
 fi
@@ -18,12 +25,16 @@ fi
 
 session_name="$(tmux display-message -p -t "$target" '#{session_name}' 2>/dev/null || true)"
 if [[ "$session_name" != cbridge-leaders-* ]]; then
-  tmux display-message "리더 레이아웃은 cbridge 리더 세션에서만 사용할 수 있습니다"
+  layout_notice "리더 레이아웃은 cbridge 리더 세션에서만 사용할 수 있습니다"
   exit 0
 fi
 
-if [[ "$layout" != "4x1" && "$layout" != "2x2" && "$layout" != "leader-left" && "$layout" != "leader-right" && "$layout" != "leader-remove" ]]; then
-  tmux display-message "알 수 없는 리더 레이아웃: $layout"
+if [[ "$layout" == "6x2" ]]; then
+  layout="2x6"
+fi
+
+if [[ "$layout" != "equal" && "$layout" != "4x1" && "$layout" != "2x2" && "$layout" != "4x2" && "$layout" != "2x6" && "$layout" != "leader-left" && "$layout" != "leader-right" && "$layout" != "leader-remove" && "$layout" != "leader-apply" ]]; then
+  layout_notice "알 수 없는 리더 레이아웃: $layout"
   exit 1
 fi
 
@@ -34,6 +45,8 @@ bridge_url="${CODEX_BRIDGE_URL:-http://localhost:8788}"
 bridge_dir="${0:A:h:h}"
 bridge_codex="${bridge_dir}/bridge-codex"
 bridge_peer="${bridge_dir}/bridge-codex-peer"
+leader_alloc_lock_dir="${CBRIDGE_LEADER_ALLOC_LOCK_DIR:-${HOME:-/Users/wjh}/.codex/state/slack-ide/leader-alloc.lockdir}"
+leader_alloc_lock_acquired=0
 
 typeset -A header_by_body
 typeset -A body_left
@@ -45,22 +58,90 @@ typeset -A leader_sidecar_created
 typeset -A leader_sidecar_position
 typeset -A leader_sidecar_left
 typeset -A leader_sidecar_top
+typeset -A body_restore_order
+typeset -A leader_sidecar_restore_order
 body_ids=()
 sidecar_ids=()
 leader_sidecar_ids=()
 
-while IFS='|' read -r pane_id left top header_for room sidecar_peer sidecar_leader sidecar_origin sidecar_created sidecar_position; do
+leader_pane_ids_for_target() {
+  tmux list-panes -t "$target" -F '#{pane_id}|#{@cbridge_room}|#{@cbridge_header_for}|#{@cbridge_sidecar_peer}' 2>/dev/null |
+    awk -F'|' '$2 ~ /^LEADER-/ && $3 == "" && $4 != "1" { print $1 }' |
+    sort
+}
+
+acquire_leader_allocation_lock() {
+  local timeout_seconds="${CBRIDGE_LEADER_ALLOC_LOCK_TIMEOUT_SECONDS:-15}"
+  local stale_seconds="${CBRIDGE_LEADER_ALLOC_LOCK_STALE_SECONDS:-120}"
+  local deadline=$(( EPOCHSECONDS + timeout_seconds ))
+  mkdir -p "$(dirname "$leader_alloc_lock_dir")" 2>/dev/null || true
+  while true; do
+    if mkdir "$leader_alloc_lock_dir" 2>/dev/null; then
+      leader_alloc_lock_acquired=1
+      print -r -- "$$ ${EPOCHSECONDS}" > "${leader_alloc_lock_dir}/owner" 2>/dev/null || true
+      return 0
+    fi
+    local mtime
+    mtime="$(stat -f %m "$leader_alloc_lock_dir" 2>/dev/null || print 0)"
+    if [[ "$mtime" == <-> && "$stale_seconds" == <-> && $(( EPOCHSECONDS - mtime )) -gt "$stale_seconds" ]]; then
+      rm -rf "$leader_alloc_lock_dir" 2>/dev/null || true
+      continue
+    fi
+    if (( EPOCHSECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+release_leader_allocation_lock() {
+  if (( leader_alloc_lock_acquired )); then
+    rm -rf "$leader_alloc_lock_dir" 2>/dev/null || true
+    leader_alloc_lock_acquired=0
+  fi
+}
+
+leader_guard_file="$(mktemp)"
+tmp_file="$(mktemp)"
+trap 'release_leader_allocation_lock; rm -f "$tmp_file" "$leader_guard_file"' EXIT
+leader_pane_ids_for_target > "$leader_guard_file"
+
+assert_leader_panes_preserved() {
+  local context="$1"
+  local after_file before_count after_count missing
+  after_file="$(mktemp)"
+  leader_pane_ids_for_target > "$after_file"
+  before_count="$(wc -l < "$leader_guard_file" | tr -d ' ')"
+  after_count="$(wc -l < "$after_file" | tr -d ' ')"
+  missing="$(comm -23 "$leader_guard_file" "$after_file" | paste -sd ', ' -)"
+  rm -f "$after_file"
+  if [[ -n "$missing" || "$after_count" -lt "$before_count" ]]; then
+    layout_notice -t "$target" "리더 pane 보존 가드 실패: $context. 사라진 pane: ${missing:-unknown}"
+    exit 1
+  fi
+}
+
+while IFS='|' read -r pane_id left top header_for room sidecar_peer sidecar_leader sidecar_origin sidecar_created sidecar_position restore_order; do
   if [[ -n "$header_for" ]]; then
     header_by_body[$header_for]="$pane_id"
     continue
   fi
   if [[ "$sidecar_leader" == "1" || "$sidecar_created" == "1" ]]; then
+    if [[ "$room" == LEADER-* && ( "$layout" == "equal" || "$layout" == "4x2" || "$layout" == "2x6" || "$layout" == "leader-apply" ) ]]; then
+      body_ids+=("$pane_id")
+      body_left[$pane_id]="$left"
+      body_top[$pane_id]="$top"
+      body_room[$pane_id]="$room"
+      body_restore_order[$pane_id]="$restore_order"
+      continue
+    fi
     leader_sidecar_ids+=("$pane_id")
     leader_sidecar_origin[$pane_id]="$sidecar_origin"
     leader_sidecar_created[$pane_id]="$sidecar_created"
     leader_sidecar_position[$pane_id]="$sidecar_position"
     leader_sidecar_left[$pane_id]="$left"
     leader_sidecar_top[$pane_id]="$top"
+    leader_sidecar_restore_order[$pane_id]="$restore_order"
     continue
   fi
   if [[ "$sidecar_peer" == "1" ]]; then
@@ -73,10 +154,16 @@ while IFS='|' read -r pane_id left top header_for room sidecar_peer sidecar_lead
     body_left[$pane_id]="$left"
     body_top[$pane_id]="$top"
     body_room[$pane_id]="$room"
+    body_restore_order[$pane_id]="$restore_order"
   fi
-done < <(tmux list-panes -t "$target" -F '#{pane_id}|#{pane_left}|#{pane_top}|#{@cbridge_header_for}|#{@cbridge_room}|#{@cbridge_sidecar_peer}|#{@cbridge_sidecar_leader}|#{@cbridge_sidecar_origin}|#{@cbridge_sidecar_created}|#{@cbridge_sidecar_position}')
+done < <(tmux list-panes -t "$target" -F '#{pane_id}|#{pane_left}|#{pane_top}|#{@cbridge_header_for}|#{@cbridge_room}|#{@cbridge_sidecar_peer}|#{@cbridge_sidecar_leader}|#{@cbridge_sidecar_origin}|#{@cbridge_sidecar_created}|#{@cbridge_sidecar_position}|#{@cbridge_restore_order}')
 
-if (( ${#body_ids[@]} > 4 )); then
+is_grid_layout=0
+if [[ "$layout" == "equal" || "$layout" == "4x2" || "$layout" == "2x6" || "$layout" == "leader-apply" ]]; then
+  is_grid_layout=1
+fi
+
+if (( ${#body_ids[@]} > 4 )) && (( ! is_grid_layout )); then
   excess_file="$(mktemp)"
   for pane_id in "${body_ids[@]}"; do
     printf '%08d\t%s\n' "${pane_id#%}" "$pane_id" >> "$excess_file"
@@ -84,6 +171,15 @@ if (( ${#body_ids[@]} > 4 )); then
   keep_ids=("${(@f)$(sort -n -k1,1 "$excess_file" | head -n 4 | cut -f2)}")
   excess_ids=("${(@f)$(sort -n -k1,1 "$excess_file" | tail -n +5 | cut -f2)}")
   rm -f "$excess_file"
+
+  if [[ "$layout" == "4x1" || "$layout" == "2x2" ]]; then
+    excess_rooms=()
+    for pane_id in "${excess_ids[@]}"; do
+      excess_rooms+=("${body_room[$pane_id]-$pane_id}")
+    done
+    layout_notice -t "$target" "추가 리더가 있어 레이아웃 변경을 중단했습니다: ${(j:, :)excess_rooms}. 자동 종료하지 않습니다."
+    exit 0
+  fi
 
   body_ids=("${keep_ids[@]}")
   for pane_id in "${excess_ids[@]}"; do
@@ -98,8 +194,8 @@ if (( ${#body_ids[@]} > 4 )); then
   done
 fi
 
-if (( ${#body_ids[@]} != 4 )); then
-  tmux display-message "리더 레이아웃에는 리더 pane 4개가 필요합니다. 현재 ${#body_ids[@]}개"
+if (( ! is_grid_layout && ${#body_ids[@]} != 4 )); then
+  layout_notice "리더 레이아웃에는 리더 pane 4개가 필요합니다. 현재 ${#body_ids[@]}개"
   exit 1
 fi
 
@@ -111,13 +207,44 @@ for pane_id in "${body_ids[@]}"; do
   fi
 done
 
-tmp_file="$(mktemp)"
-trap 'rm -f "$tmp_file"' EXIT
+if (( ! has_all_headers )) && [[ -z "${CBRIDGE_LAYOUT_AFTER_TITLE_SYNC:-}" ]]; then
+  bun_bin="${BUN_BIN:-${HOME:-/Users/wjh}/.bun/bin/bun}"
+  bridge_ts="${bridge_dir}/covering-bridge.ts"
+  if [[ -x "$bun_bin" && -f "$bridge_ts" ]]; then
+    CBRIDGE_LAYOUT_AFTER_TITLE_SYNC=1 "$bun_bin" "$bridge_ts" tmux-pane-titles >/dev/null 2>&1 || true
+    export CBRIDGE_LAYOUT_AFTER_TITLE_SYNC=1
+    exec "$0" "$layout" "$target" "$active_pane"
+  fi
+fi
+
 for pane_id in "${body_ids[@]}"; do
-  printf '%s\t%s\t%s\n' "${body_top[$pane_id]}" "${body_left[$pane_id]}" "$pane_id" >> "$tmp_file"
+  restore_order="${body_restore_order[$pane_id]-}"
+  if [[ -n "$restore_order" && "$restore_order" == <-> ]]; then
+    printf '%08d\t%08d\t%s\n' "$restore_order" 0 "$pane_id" >> "$tmp_file"
+  else
+    printf '%08d\t%08d\t%s\n' "${body_top[$pane_id]}" "${body_left[$pane_id]}" "$pane_id" >> "$tmp_file"
+  fi
 done
 
 ordered_body_ids=("${(@f)$(sort -n -k1,1 -k2,2 "$tmp_file" | cut -f3)}")
+
+normalize_pane_order_for_body_ids() {
+  local -a desired_order current_order
+  desired_order=()
+  local pane_id header_id i
+  for pane_id in "${ordered_body_ids[@]}"; do
+    header_id="${header_by_body[$pane_id]-}"
+    [[ -n "$header_id" ]] && desired_order+=("$header_id")
+    desired_order+=("$pane_id")
+  done
+
+  for (( i = 1; i <= ${#desired_order[@]}; i++ )); do
+    current_order=("${(@f)$(tmux list-panes -t "$target" -F '#{pane_id}')}")
+    if [[ -n "${current_order[$i]-}" && "${current_order[$i]}" != "${desired_order[$i]}" ]]; then
+      tmux swap-pane -s "${desired_order[$i]}" -t "${current_order[$i]}" 2>/dev/null || true
+    fi
+  done
+}
 
 if (( ! has_all_headers )) && [[ "$layout" == "4x1" || "$layout" == "2x2" ]] && (( ${#sidecar_ids[@]} == 0 && ${#leader_sidecar_ids[@]} == 0 )); then
   if [[ "$layout" == "4x1" ]]; then
@@ -125,10 +252,11 @@ if (( ! has_all_headers )) && [[ "$layout" == "4x1" || "$layout" == "2x2" ]] && 
   else
     tmux select-layout -t "$target" tiled
   fi
+  assert_leader_panes_preserved "$layout"
   if [[ -n "$active_pane" ]]; then
     tmux select-pane -t "$active_pane" 2>/dev/null || true
   fi
-  tmux display-message -t "$target" "리더 레이아웃: $layout"
+  layout_notice -t "$target" "리더 레이아웃: $layout"
   exit 0
 fi
 
@@ -398,14 +526,41 @@ return_all_leader_sidecars() {
   print -r -- "$removed"
 }
 
+leader_sidecar_room_list() {
+  local pane_id room
+  local -a rooms
+  rooms=()
+  for pane_id in "${leader_sidecar_ids[@]}"; do
+    room="$(pane_room "$pane_id")"
+    if [[ -n "$room" ]]; then
+      rooms+=("$room")
+    fi
+  done
+  if (( ${#rooms[@]} == 0 )); then
+    print -r -- "알 수 없음"
+  else
+    print -r -- "${(j:, :)rooms}"
+  fi
+}
+
 header_for() {
   local body_id="$1"
   local header_id="${header_by_body[$body_id]-}"
   if [[ -z "$header_id" ]]; then
-    tmux display-message "리더 pane ${body_room[$body_id]}의 제목 헤더가 없습니다"
+    layout_notice "리더 pane ${body_room[$body_id]}의 제목 헤더가 없습니다"
     exit 1
   fi
   print -r -- "$header_id"
+}
+
+normalize_title_header_heights() {
+  tmux list-panes -t "$target" -F '#{pane_id}|#{@cbridge_header_for}|#{@cbridge_title_header}' 2>/dev/null |
+    while IFS='|' read -r pane_id header_for title_header; do
+      [[ -n "${pane_id:-}" ]] || continue
+      [[ -n "${header_for:-}" || "$title_header" == "1" ]] || continue
+      tmux resize-pane -t "$pane_id" -y "$header_height" 2>/dev/null || true
+      tmux select-pane -t "$pane_id" -T '' 2>/dev/null || true
+    done
 }
 
 column_pair() {
@@ -448,7 +603,7 @@ leader_row_plain() {
   local right_body_id="$6"
   local col_widths=("${(@f)$(distribute_with_separators "$width" 2)}")
   local right_x=$(( x + col_widths[1] + 1 ))
-  print -r -- "${width}x${height},${x},${y}{${col_widths[1]}x${height},${x},${y},$(pane_number "$left_body_id"),${col_widths[2]}x${height},${right_x},${y},$(pane_number "$right_body_id")}"
+  print -r -- "${width}x${height},${x},${y}{$(leader_grid_cell "$y" "${col_widths[1]}" "$x" "$height" "$left_body_id"),$(leader_grid_cell "$y" "${col_widths[2]}" "$right_x" "$height" "$right_body_id")}"
 }
 
 leader_grid_2x2_plain() {
@@ -463,18 +618,265 @@ leader_grid_2x2_plain() {
   print -r -- "${width}x${window_height},${x},0[${top_row},${bottom_row}]"
 }
 
+leader_grid_cell() {
+  local y="$1"
+  local width="$2"
+  local x="$3"
+  local height="$4"
+  local body_id="$5"
+  local header_id="${header_by_body[$body_id]-}"
+  if [[ -n "$header_id" && "$height" -gt $(( header_height + 3 )) ]]; then
+    local body_height=$(( height - header_height - 1 ))
+    print -r -- "${width}x${height},${x},${y}[${width}x${header_height},${x},${y},$(pane_number "$header_id"),${width}x${body_height},${x},$(( y + header_height + 1 )),$(pane_number "$body_id")]"
+  else
+    print -r -- "${width}x${height},${x},${y},$(pane_number "$body_id")"
+  fi
+}
+
+leader_grid_row_plain() {
+  local y="$1"
+  local height="$2"
+  shift 2
+  local pane_ids=("$@")
+  local col_count="${#pane_ids[@]}"
+  local col_widths=("${(@f)$(distribute_with_separators "$window_width" "$col_count")}")
+  local x=0
+  local -a cells
+  cells=()
+  local i
+  for (( i = 1; i <= col_count; i++ )); do
+    cells+=("$(leader_grid_cell "$y" "${col_widths[$i]}" "$x" "$height" "${pane_ids[$i]}")")
+    x=$(( x + col_widths[$i] + 1 ))
+  done
+
+  if (( col_count == 1 )); then
+    print -r -- "$(leader_grid_cell "$y" "$window_width" 0 "$height" "${pane_ids[1]}")"
+  else
+    print -r -- "${window_width}x${height},0,${y}{${(j:,:)cells}}"
+  fi
+}
+
+body_visual_top() {
+  local pane_id="$1"
+  local top="${body_top[$pane_id]-0}"
+  if [[ "$top" != <-> ]]; then
+    top=0
+  fi
+  if [[ -n "${header_by_body[$pane_id]-}" ]]; then
+    top=$(( top - header_height - 1 ))
+  fi
+  if (( top < 0 )); then
+    top=0
+  fi
+  print -r -- "$top"
+}
+
+equal_current_row_groups() {
+  local rows_file sorted_file pane_id top left
+  rows_file="$(mktemp)"
+  sorted_file="$(mktemp)"
+
+  for pane_id in "${body_ids[@]}"; do
+    top="$(body_visual_top "$pane_id")"
+    left="${body_left[$pane_id]-0}"
+    if [[ "$left" != <-> ]]; then
+      left=0
+    fi
+    printf '%08d\t%08d\t%s\n' "$top" "$left" "$pane_id" >> "$rows_file"
+  done
+
+  sort -n -k1,1 -k2,2 "$rows_file" > "$sorted_file"
+
+  local row_tolerance=1
+  local current_top="" row_top pane_left
+  local -a current_panes
+  current_panes=()
+  while IFS=$'\t' read -r row_top pane_left pane_id; do
+    [[ -n "${pane_id:-}" ]] || continue
+    if [[ -z "$current_top" ]]; then
+      current_top="$row_top"
+      current_panes=("$pane_id")
+      continue
+    fi
+    if (( row_top - current_top <= row_tolerance )); then
+      current_panes+=("$pane_id")
+    else
+      print -r -- "${(j: :)current_panes}"
+      current_top="$row_top"
+      current_panes=("$pane_id")
+    fi
+  done < "$sorted_file"
+
+  if (( ${#current_panes[@]} > 0 )); then
+    print -r -- "${(j: :)current_panes}"
+  fi
+
+  rm -f "$rows_file" "$sorted_file"
+}
+
+apply_equal_current_layout() {
+  if (( ${#body_ids[@]} == 0 )); then
+    layout_notice -t "$target" "정렬할 리더 pane이 없습니다"
+    exit 1
+  fi
+
+  local -a row_groups flattened row_panes row_layouts row_heights
+  row_groups=("${(@f)$(equal_current_row_groups)}")
+  if (( ${#row_groups[@]} == 0 )); then
+    layout_notice -t "$target" "정렬할 리더 pane이 없습니다"
+    exit 1
+  fi
+
+  flattened=()
+  local row_group pane_id
+  for row_group in "${row_groups[@]}"; do
+    row_panes=()
+    read -rA row_panes <<< "$row_group"
+    flattened+=("${row_panes[@]}")
+  done
+  ordered_body_ids=("${flattened[@]}")
+  normalize_pane_order_for_body_ids
+
+  row_heights=("${(@f)$(distribute_with_separators "$window_height" "${#row_groups[@]}")}")
+  row_layouts=()
+  local y=0
+  local row height
+  for (( row = 1; row <= ${#row_groups[@]}; row++ )); do
+    row_panes=()
+    read -rA row_panes <<< "${row_groups[$row]}"
+    height="${row_heights[$row]}"
+    row_layouts+=("$(leader_grid_row_plain "$y" "$height" "${row_panes[@]}")")
+    y=$(( y + height + 1 ))
+  done
+
+  if (( ${#row_layouts[@]} == 1 )); then
+    layout_body="${row_layouts[1]}"
+  else
+    layout_body="${window_width}x${window_height},0,0[${(j:,:)row_layouts}]"
+  fi
+
+  layout_checksum="$(checksum "$layout_body")"
+  tmux select-layout -t "$target" "${layout_checksum},${layout_body}"
+
+  local i header_id
+  for (( i = 1; i <= ${#ordered_body_ids[@]}; i++ )); do
+    pane_id="${ordered_body_ids[$i]}"
+    tmux set-option -pt "$pane_id" @cbridge_restore_order "$i" 2>/dev/null || true
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_leader 0 2>/dev/null || true
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_created 0 2>/dev/null || true
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_position '' 2>/dev/null || true
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_origin '' 2>/dev/null || true
+    header_id="${header_by_body[$pane_id]-}"
+    if [[ -n "$header_id" ]]; then
+      tmux set-option -pt "$header_id" @cbridge_restore_order "$i" 2>/dev/null || true
+    fi
+  done
+
+  normalize_title_header_heights
+  assert_leader_panes_preserved "$layout"
+}
+
+apply_leader_grid_layout() {
+  if (( ${#ordered_body_ids[@]} == 0 )); then
+    layout_notice -t "$target" "정렬할 리더 pane이 없습니다"
+    exit 1
+  fi
+  if [[ "$layout" == "4x2" ]] && (( ${#ordered_body_ids[@]} > 8 )); then
+    layout_notice -t "$target" "4열 2행은 리더 pane 8개까지만 지원합니다. 현재 ${#ordered_body_ids[@]}개"
+    exit 1
+  fi
+  if [[ "$layout" == "2x6" ]] && (( ${#ordered_body_ids[@]} > 12 )); then
+    layout_notice -t "$target" "6행 2열은 리더 pane 12개까지만 지원합니다. 현재 ${#ordered_body_ids[@]}개"
+    exit 1
+  fi
+  local pane_count="${#ordered_body_ids[@]}"
+  local cols
+  if [[ "$layout" == "4x2" ]]; then
+    cols=4
+  elif [[ "$layout" == "2x6" ]]; then
+    cols=2
+  elif (( pane_count <= 1 )); then
+    cols=1
+  elif (( pane_count == 2 )); then
+    cols=2
+  elif (( pane_count == 3 )); then
+    cols=3
+  elif (( pane_count == 4 )); then
+    cols=2
+  elif (( pane_count <= 6 )); then
+    cols=3
+  else
+    cols=4
+  fi
+
+  local rows=$(( (${#ordered_body_ids[@]} + cols - 1) / cols ))
+  if (( rows < 1 )); then rows=1; fi
+  normalize_pane_order_for_body_ids
+
+  local row_heights=("${(@f)$(distribute_with_separators "$window_height" "$rows")}")
+  local y=0
+  local idx=1
+  local -a row_layouts row_panes
+  row_layouts=()
+  local row remaining col_count height
+  for (( row = 1; row <= rows; row++ )); do
+    remaining=$(( ${#ordered_body_ids[@]} - idx + 1 ))
+    col_count="$cols"
+    if (( remaining < col_count )); then col_count="$remaining"; fi
+    row_panes=()
+    local grid_col=0
+    for (( grid_col = 1; grid_col <= col_count; grid_col++ )); do
+      row_panes+=("${ordered_body_ids[$idx]}")
+      idx=$(( idx + 1 ))
+    done
+    height="${row_heights[$row]}"
+    row_layouts+=("$(leader_grid_row_plain "$y" "$height" "${row_panes[@]}")")
+    y=$(( y + height + 1 ))
+  done
+
+  if (( rows == 1 )); then
+    layout_body="${row_layouts[1]}"
+  else
+    layout_body="${window_width}x${window_height},0,0[${(j:,:)row_layouts}]"
+  fi
+
+  layout_checksum="$(checksum "$layout_body")"
+  tmux select-layout -t "$target" "${layout_checksum},${layout_body}"
+
+  local i pane_id header_id
+  for (( i = 1; i <= ${#ordered_body_ids[@]}; i++ )); do
+    pane_id="${ordered_body_ids[$i]}"
+    tmux set-option -pt "$pane_id" @cbridge_restore_order "$i" 2>/dev/null || true
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_leader 0 2>/dev/null || true
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_created 0 2>/dev/null || true
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_position '' 2>/dev/null || true
+    tmux set-option -pt "$pane_id" @cbridge_sidecar_origin '' 2>/dev/null || true
+    header_id="${header_by_body[$pane_id]-}"
+    if [[ -n "$header_id" ]]; then
+      tmux set-option -pt "$header_id" @cbridge_restore_order "$i" 2>/dev/null || true
+    fi
+  done
+
+  normalize_title_header_heights
+  assert_leader_panes_preserved "$layout"
+}
+
 side_column_two_rows_plain() {
   local width="$1"
   local x="$2"
   local top_pane="$3"
   local bottom_pane="${4:-}"
   if [[ -z "$bottom_pane" ]]; then
-    print -r -- "${width}x${window_height},${x},0,$(pane_number "$top_pane")"
+    print -r -- "$(leader_grid_cell 0 "$width" "$x" "$window_height" "$top_pane")"
     return 0
   fi
   local row_heights=("${(@f)$(distribute_with_separators "$window_height" 2)}")
   local bottom_y=$(( row_heights[1] + 1 ))
-  print -r -- "${width}x${window_height},${x},0[${width}x${row_heights[1]},${x},0,$(pane_number "$top_pane"),${width}x${row_heights[2]},${x},${bottom_y},$(pane_number "$bottom_pane")]"
+  local top_cell
+  local bottom_cell
+  top_cell="$(leader_grid_cell 0 "$width" "$x" "${row_heights[1]}" "$top_pane")"
+  bottom_cell="$(leader_grid_cell "$bottom_y" "$width" "$x" "${row_heights[2]}" "$bottom_pane")"
+  print -r -- "${width}x${window_height},${x},0[${top_cell},${bottom_cell}]"
 }
 
 sidecar_pairs_for_position() {
@@ -499,7 +901,12 @@ sidecar_pairs_for_position() {
     fi
     [[ "$pane_position" == "$position" ]] || continue
     pane_top="${leader_sidecar_top[$pane_id]-0}"
-    printf '%08d\t%08d\t%s\n' "${pane_id#%}" "$pane_top" "$pane_id" >> "$panes_file"
+    pane_order="${leader_sidecar_restore_order[$pane_id]-}"
+    if [[ -n "$pane_order" && "$pane_order" == <-> ]]; then
+      printf '%08d\t%08d\t%s\n' "$pane_order" "$pane_top" "$pane_id" >> "$panes_file"
+    else
+      printf '%08d\t%08d\t%s\n' "${pane_id#%}" "$pane_top" "$pane_id" >> "$panes_file"
+    fi
   done
 
   if [[ ! -s "$panes_file" ]]; then
@@ -518,11 +925,6 @@ sidecar_pairs_for_position() {
 }
 
 apply_leader_sidecar_layout() {
-  if (( has_all_headers )); then
-    tmux display-message -t "$target" "리더 열 추가는 border-title 리더 pane에서만 사용할 수 있습니다"
-    exit 1
-  fi
-
   local -a left_pairs
   local -a right_pairs
   local pair
@@ -537,7 +939,7 @@ apply_leader_sidecar_layout() {
 
   local side_count=$(( ${#left_pairs[@]} + ${#right_pairs[@]} ))
   if (( side_count == 0 )); then
-    tmux display-message -t "$target" "생성된 리더 열이 없습니다"
+    layout_notice -t "$target" "생성된 리더 열이 없습니다"
     exit 1
   fi
 
@@ -548,7 +950,7 @@ apply_leader_sidecar_layout() {
   if (( main_width < 64 )); then
     side_width=$(( (window_width - 64 - side_count) / side_count ))
     if (( side_width < 24 )); then
-      tmux display-message -t "$target" "창이 너무 좁아 리더 열을 추가할 수 없습니다"
+      layout_notice -t "$target" "창이 너무 좁아 리더 열을 추가할 수 없습니다"
       exit 1
     fi
     main_width=$(( window_width - side_count * side_width - side_count ))
@@ -576,26 +978,67 @@ apply_leader_sidecar_layout() {
 
   layout_checksum="$(checksum "$layout_body")"
   tmux select-layout -t "$target" "${layout_checksum},${layout_body}"
+
+  local -a desired_order current_order
+  desired_order=()
+  for pair in "${left_pairs[@]}"; do
+    top_pane="${pair%%|*}"
+    bottom_pane="${pair#*|}"
+    desired_order+=("$top_pane")
+    [[ -n "$bottom_pane" ]] && desired_order+=("$bottom_pane")
+  done
+  desired_order+=("${ordered_body_ids[1]}" "${ordered_body_ids[2]}" "${ordered_body_ids[3]}" "${ordered_body_ids[4]}")
+  for pair in "${right_pairs[@]}"; do
+    top_pane="${pair%%|*}"
+    bottom_pane="${pair#*|}"
+    desired_order+=("$top_pane")
+    [[ -n "$bottom_pane" ]] && desired_order+=("$bottom_pane")
+  done
+  local i
+  for (( i = 1; i <= ${#desired_order[@]}; i++ )); do
+    current_order=("${(@f)$(tmux list-panes -t "$target" -F '#{pane_id}')}")
+    if [[ -n "${current_order[$i]-}" && "${current_order[$i]}" != "${desired_order[$i]}" ]]; then
+      tmux swap-pane -s "${desired_order[$i]}" -t "${current_order[$i]}" 2>/dev/null || true
+    fi
+  done
+  normalize_title_header_heights
+  assert_leader_panes_preserved "$layout"
 }
 
 if [[ "$layout" == "leader-remove" ]]; then
-  removed="$(return_all_leader_sidecars)"
+  exec "$0" equal "$target" "$active_pane"
+fi
+
+if [[ "$layout" == "equal" ]]; then
+  apply_equal_current_layout
   if [[ -n "$active_pane" ]]; then
-    tmux select-pane -t "$active_pane" 2>/dev/null || tmux select-pane -t "${ordered_body_ids[1]}" 2>/dev/null || true
+    tmux select-pane -t "$active_pane" 2>/dev/null || true
   fi
-  tmux select-layout -t "$target" tiled 2>/dev/null || true
-  tmux display-message -t "$target" "생성한 리더 열 삭제: ${removed}개"
+  layout_notice -t "$target" "리더 레이아웃: 균등 정렬"
+  exit 0
+fi
+
+if [[ "$layout" == "4x2" || "$layout" == "2x6" || "$layout" == "leader-apply" ]]; then
+  apply_leader_grid_layout
+  if [[ -n "$active_pane" ]]; then
+    tmux select-pane -t "$active_pane" 2>/dev/null || true
+  fi
+  if [[ "$layout" == "2x6" ]]; then
+    layout_notice -t "$target" "리더 레이아웃: 6행 2열"
+  else
+    layout_notice -t "$target" "리더 레이아웃: 균등 정렬"
+  fi
   exit 0
 fi
 
 if [[ "$layout" == "leader-left" || "$layout" == "leader-right" ]]; then
   if [[ -z "$active_pane" ]]; then
-    tmux display-message -t "$target" "먼저 리더 pane을 선택하세요"
+    layout_notice -t "$target" "먼저 리더 pane을 선택하세요"
     exit 1
   fi
   active_room="$(pane_room "$active_pane")"
   if [[ "$active_room" != LEADER-* ]]; then
-    tmux display-message -t "$target" "리더 열을 추가하려면 LEADER pane을 선택하세요"
+    layout_notice -t "$target" "리더 열을 추가하려면 LEADER pane을 선택하세요"
     exit 1
   fi
 
@@ -606,6 +1049,10 @@ if [[ "$layout" == "leader-left" || "$layout" == "leader-right" ]]; then
     active_workdir="${HOME:-/Users/wjh}"
   fi
 
+  if ! acquire_leader_allocation_lock; then
+    layout_notice -t "$target" "리더 번호 배정이 잠시 사용 중입니다. 잠시 뒤 다시 시도하세요"
+    exit 1
+  fi
   leader_rooms=("${(@f)$(next_leader_rooms)}")
   top_leader_room="${leader_rooms[1]}"
   bottom_leader_room="${leader_rooms[2]}"
@@ -617,6 +1064,7 @@ if [[ "$layout" == "leader-left" || "$layout" == "leader-right" ]]; then
     top_leader_pane="$(create_leader_pane "$top_leader_room" "${ordered_body_ids[4]}" 0 "$active_workdir")"
     bottom_leader_pane="$(create_leader_pane "$bottom_leader_room" "$top_leader_pane" 0 "$active_workdir")"
   fi
+  release_leader_allocation_lock
 
   tmux set-option -pt "$top_leader_pane" @cbridge_sidecar_position "$position" 2>/dev/null || true
   tmux set-option -pt "$bottom_leader_pane" @cbridge_sidecar_position "$position" 2>/dev/null || true
@@ -633,20 +1081,23 @@ if [[ "$layout" == "leader-left" || "$layout" == "leader-right" ]]; then
   apply_leader_sidecar_layout
   tmux select-pane -t "$active_pane" 2>/dev/null || true
   if [[ "$position" == "left" ]]; then
-    tmux display-message -t "$target" "리더 레이아웃: ${top_leader_room}, ${bottom_leader_room} 왼쪽 생성"
+    layout_notice -t "$target" "리더 레이아웃: ${top_leader_room}, ${bottom_leader_room} 왼쪽 생성"
   else
-    tmux display-message -t "$target" "리더 레이아웃: ${top_leader_room}, ${bottom_leader_room} 오른쪽 생성"
+    layout_notice -t "$target" "리더 레이아웃: ${top_leader_room}, ${bottom_leader_room} 오른쪽 생성"
   fi
   exit 0
 fi
 
 if (( ${#leader_sidecar_ids[@]} > 0 )); then
-  return_all_leader_sidecars >/dev/null || true
+  layout_notice -t "$target" "추가 리더가 있어 레이아웃 변경을 중단했습니다: $(leader_sidecar_room_list). 자동 종료하지 않습니다."
+  exit 0
 fi
 
 if (( ${#sidecar_ids[@]} > 0 )); then
   return_all_sidecars >/dev/null || true
 fi
+
+normalize_pane_order_for_body_ids
 
 if (( ! has_all_headers )) && [[ "$layout" == "4x1" || "$layout" == "2x2" ]]; then
   if [[ "$layout" == "4x1" ]]; then
@@ -654,10 +1105,11 @@ if (( ! has_all_headers )) && [[ "$layout" == "4x1" || "$layout" == "2x2" ]]; th
   else
     tmux select-layout -t "$target" tiled
   fi
+  assert_leader_panes_preserved "$layout"
   if [[ -n "$active_pane" ]]; then
     tmux select-pane -t "$active_pane" 2>/dev/null || true
   fi
-  tmux display-message -t "$target" "리더 레이아웃: $layout"
+  layout_notice -t "$target" "리더 레이아웃: $layout"
   exit 0
 fi
 
@@ -680,7 +1132,9 @@ fi
 
 layout_checksum="$(checksum "$layout_body")"
 tmux select-layout -t "$target" "${layout_checksum},${layout_body}"
+normalize_title_header_heights
+assert_leader_panes_preserved "$layout"
 if [[ -n "$active_pane" ]]; then
   tmux select-pane -t "$active_pane" 2>/dev/null || true
 fi
-tmux display-message -t "$target" "리더 레이아웃: $layout"
+layout_notice -t "$target" "리더 레이아웃: $layout"
